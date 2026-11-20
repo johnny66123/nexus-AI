@@ -1,0 +1,372 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default-Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Reusable Security Primitives ---
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isVerifiedOwner(userId) {
+      return isVerified() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerified() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        request.auth.token.email == 'saalamax123@gmail.com'
+      );
+    }
+
+    function isTimestampStr(val) {
+      return val is string && val.size() >= 10 && val.size() <= 40;
+    }
+
+    // --- Validation Blueprints ---
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'roleTitle', 'role', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'roleTitle', 'role', 'status', 'defaultProvider', 'defaultModel', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 120
+        && data.displayName is string && data.displayName.size() >= 2 && data.displayName.size() <= 60
+        && data.roleTitle is string && data.roleTitle.size() >= 2 && data.roleTitle.size() <= 80
+        && data.role in ['admin', 'developer', 'viewer']
+        && data.status in ['active', 'suspended']
+        && (!('defaultProvider' in data) || data.defaultProvider in ['auto', 'google', 'anthropic', 'openai'])
+        && (!('defaultModel' in data) || (data.defaultModel is string && data.defaultModel.size() <= 80))
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidAssistant(data, userId) {
+      return data.keys().hasAll(['id', 'ownerUserId', 'name', 'description', 'purpose', 'personality', 'instructions', 'model', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'ownerUserId', 'name', 'description', 'purpose', 'personality', 'instructions', 'provider', 'model', 'isPublic', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.ownerUserId is string && data.ownerUserId == userId
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 60
+        && data.description is string && data.description.size() >= 10 && data.description.size() <= 240
+        && data.purpose is string && data.purpose.size() >= 2 && data.purpose.size() <= 80
+        && data.personality is string && data.personality.size() >= 5 && data.personality.size() <= 240
+        && data.instructions is string && data.instructions.size() >= 10 && data.instructions.size() <= 4000
+        && (!('provider' in data) || data.provider in ['google', 'anthropic', 'openai'])
+        && data.model is string && data.model.size() >= 1 && data.model.size() <= 80
+        && (!('isPublic' in data) || data.isPublic is bool)
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidConversation(data, userId) {
+      return data.keys().hasAll(['id', 'assistantId', 'userId', 'title', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'assistantId', 'userId', 'title', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && isValidId(data.assistantId)
+        && data.userId is string && data.userId == userId
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 100
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidMessage(data, userId, conversationId) {
+      return data.keys().hasAll(['id', 'userId', 'conversationId', 'role', 'content', 'createdAt'])
+        && data.keys().hasOnly(['id', 'userId', 'conversationId', 'role', 'content', 'providerUsed', 'modelUsed', 'createdAt'])
+        && isValidId(data.id)
+        && data.userId is string && data.userId == userId
+        && data.conversationId is string && data.conversationId == conversationId
+        && data.role in ['user', 'model']
+        && data.content is string && data.content.size() >= 1 && data.content.size() <= 16000
+        && (!('providerUsed' in data) || (data.providerUsed is string && data.providerUsed.size() <= 40))
+        && (!('modelUsed' in data) || (data.modelUsed is string && data.modelUsed.size() <= 80))
+        && isTimestampStr(data.createdAt);
+    }
+
+    function isValidResearchProject(data, userId) {
+      return data.keys().hasAll(['id', 'userId', 'title', 'question', 'researchType', 'visibility', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'userId', 'title', 'question', 'researchType', 'visibility', 'status', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.userId is string && data.userId == userId
+        && data.title is string && data.title.size() >= 2 && data.title.size() <= 160
+        && data.question is string && data.question.size() >= 6 && data.question.size() <= 2000
+        && data.researchType is string && data.researchType.size() <= 40
+        && data.visibility in ['private', 'workspace']
+        && data.status in ['running', 'completed', 'completed_with_warnings', 'incomplete_search_failed', 'failed']
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidResearchSource(data, userId) {
+      return data.keys().hasAll(['id', 'projectId', 'userId', 'citationKey', 'title', 'url', 'reliabilityTier', 'savedToLibrary', 'createdAt'])
+        && data.keys().hasOnly(['id', 'projectId', 'userId', 'citationKey', 'title', 'url', 'reliabilityTier', 'savedToLibrary', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.projectId)
+        && data.userId is string && data.userId == userId
+        && data.citationKey is string && data.citationKey.size() >= 1 && data.citationKey.size() <= 16
+        && data.title is string && data.title.size() >= 1 && data.title.size() <= 300
+        && data.url is string && data.url.size() >= 1 && data.url.size() <= 1000
+        && data.reliabilityTier in ['high', 'moderate', 'low', 'unknown']
+        && data.savedToLibrary is bool
+        && isTimestampStr(data.createdAt);
+    }
+
+    function isValidSpecialistAgent(data, userId) {
+      return data.keys().hasAll(['id', 'userId', 'roleKey', 'name', 'description', 'instructions', 'preferredProvider', 'preferredModel', 'enabled', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'userId', 'roleKey', 'name', 'description', 'instructions', 'preferredProvider', 'preferredModel', 'enabled', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.userId is string && data.userId == userId
+        && data.roleKey in ['research', 'analysis', 'fact_check', 'academic', 'writing', 'coding']
+        && data.name is string && data.name.size() >= 2 && data.name.size() <= 80
+        && data.description is string && data.description.size() >= 5 && data.description.size() <= 300
+        && data.instructions is string && data.instructions.size() >= 10 && data.instructions.size() <= 4000
+        && data.preferredProvider in ['auto', 'google', 'anthropic', 'openai']
+        && data.preferredModel is string && data.preferredModel.size() >= 1 && data.preferredModel.size() <= 80
+        && data.enabled is bool
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidAgentTask(data, userId) {
+      return data.keys().hasAll(['id', 'userId', 'agentId', 'title', 'inputPrompt', 'status', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'userId', 'agentId', 'title', 'inputPrompt', 'output', 'providerUsed', 'modelUsed', 'status', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.userId is string && data.userId == userId
+        && isValidId(data.agentId)
+        && data.title is string && data.title.size() >= 2 && data.title.size() <= 160
+        && data.inputPrompt is string && data.inputPrompt.size() >= 1 && data.inputPrompt.size() <= 8000
+        && (!('output' in data) || (data.output is string && data.output.size() <= 20000))
+        && (!('providerUsed' in data) || (data.providerUsed is string && data.providerUsed.size() <= 40))
+        && (!('modelUsed' in data) || (data.modelUsed is string && data.modelUsed.size() <= 80))
+        && data.status in ['pending', 'running', 'completed', 'failed', 'awaiting_approval']
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidProviderSetting(data, userId) {
+      return data.keys().hasAll(['id', 'userId', 'provider', 'enabled', 'defaultModel', 'priority', 'timeoutMs', 'maxRetries', 'fallbackEnabled', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['id', 'userId', 'provider', 'enabled', 'defaultModel', 'priority', 'timeoutMs', 'maxRetries', 'fallbackEnabled', 'createdAt', 'updatedAt'])
+        && isValidId(data.id)
+        && data.userId is string && data.userId == userId
+        && data.provider in ['google', 'anthropic', 'openai']
+        && data.enabled is bool
+        && data.defaultModel is string && data.defaultModel.size() >= 1 && data.defaultModel.size() <= 80
+        && data.priority is int && data.priority >= 1 && data.priority <= 10
+        && data.timeoutMs is int && data.timeoutMs >= 2000 && data.timeoutMs <= 120000
+        && data.maxRetries is int && data.maxRetries >= 0 && data.maxRetries <= 3
+        && data.fallbackEnabled is bool
+        && isTimestampStr(data.createdAt)
+        && isTimestampStr(data.updatedAt);
+    }
+
+    function isValidUsageRecord(data, userId) {
+      return data.keys().hasAll(['id', 'userId', 'provider', 'model', 'taskType', 'status', 'totalTokens', 'latencyMs', 'fallbackUsed', 'createdAt'])
+        && data.keys().hasOnly(['id', 'userId', 'provider', 'model', 'taskType', 'status', 'inputTokens', 'outputTokens', 'totalTokens', 'latencyMs', 'fallbackUsed', 'createdAt'])
+        && isValidId(data.id)
+        && data.userId is string && data.userId == userId
+        && data.provider in ['google', 'anthropic', 'openai']
+        && data.model is string && data.model.size() >= 1 && data.model.size() <= 80
+        && data.taskType is string && data.taskType.size() >= 1 && data.taskType.size() <= 40
+        && data.status in ['success', 'fallback_success', 'error']
+        && (!('inputTokens' in data) || (data.inputTokens is int && data.inputTokens >= 0))
+        && (!('outputTokens' in data) || (data.outputTokens is int && data.outputTokens >= 0))
+        && data.totalTokens is int && data.totalTokens >= 0
+        && data.latencyMs is int && data.latencyMs >= 0
+        && data.fallbackUsed is bool
+        && isTimestampStr(data.createdAt);
+    }
+
+    // --- User Accounts (PII Isolated to Owner or Verified Admin) ---
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && isVerifiedOwner(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().role == 'developer'
+        && incoming().status == 'active';
+      allow update: if isValidId(userId)
+        && isValidUserAccount(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin() ||
+          (
+            isVerifiedOwner(userId)
+            && incoming().role == existing().role
+            && incoming().status == existing().status
+            && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'roleTitle', 'defaultProvider', 'defaultModel', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(userId) && isAdmin();
+
+      // --- User Assistants ---
+      match /assistants/{assistantId} {
+        allow get: if isValidId(userId) && isValidId(assistantId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(assistantId)
+          && isVerifiedOwner(userId)
+          && isValidAssistant(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(assistantId)
+          && isVerifiedOwner(userId)
+          && isValidAssistant(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().ownerUserId == existing().ownerUserId
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'purpose', 'personality', 'instructions', 'provider', 'model', 'isPublic', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(assistantId) && (isVerifiedOwner(userId) || isAdmin());
+      }
+
+      // --- Conversations & Nested Messages ---
+      match /conversations/{conversationId} {
+        allow get: if isValidId(userId) && isValidId(conversationId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(conversationId)
+          && isVerifiedOwner(userId)
+          && isValidConversation(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(conversationId)
+          && isVerifiedOwner(userId)
+          && isValidConversation(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().assistantId == existing().assistantId
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(conversationId) && (isVerifiedOwner(userId) || isAdmin());
+
+        match /messages/{messageId} {
+          allow get: if isValidId(userId) && isValidId(conversationId) && isValidId(messageId) && (isOwner(userId) || isAdmin());
+          allow list: if isValidId(userId) && isValidId(conversationId) && (isOwner(userId) || isAdmin());
+          allow create: if isValidId(userId) && isValidId(conversationId) && isValidId(messageId)
+            && isVerifiedOwner(userId)
+            && isValidMessage(incoming(), userId, conversationId)
+            && exists(/databases/$(database)/documents/users/$(userId)/conversations/$(conversationId));
+          allow update: if false;
+          allow delete: if isValidId(userId) && isValidId(conversationId) && isValidId(messageId) && (isVerifiedOwner(userId) || isAdmin());
+        }
+      }
+
+      // --- Research Projects ---
+      match /researchProjects/{projectId} {
+        allow get: if isValidId(userId) && isValidId(projectId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(projectId)
+          && isVerifiedOwner(userId)
+          && isValidResearchProject(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(projectId)
+          && isVerifiedOwner(userId)
+          && isValidResearchProject(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'visibility', 'status', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(projectId) && (isVerifiedOwner(userId) || isAdmin());
+      }
+
+      // --- Research Sources ---
+      match /researchSources/{sourceId} {
+        allow get: if isValidId(userId) && isValidId(sourceId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(sourceId)
+          && isVerifiedOwner(userId)
+          && isValidResearchSource(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(sourceId)
+          && isVerifiedOwner(userId)
+          && isValidResearchSource(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().projectId == existing().projectId
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['savedToLibrary']);
+        allow delete: if isValidId(userId) && isValidId(sourceId) && (isVerifiedOwner(userId) || isAdmin());
+      }
+
+      // --- Configurable Specialist Agents ---
+      match /specialistAgents/{agentId} {
+        allow get: if isValidId(userId) && isValidId(agentId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(agentId)
+          && isVerifiedOwner(userId)
+          && isValidSpecialistAgent(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(agentId)
+          && isVerifiedOwner(userId)
+          && isValidSpecialistAgent(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().roleKey == existing().roleKey
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description', 'instructions', 'preferredProvider', 'preferredModel', 'enabled', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(agentId) && (isVerifiedOwner(userId) || isAdmin());
+      }
+
+      // --- Agent Tasks (Terminal State Locked) ---
+      match /agentTasks/{taskId} {
+        allow get: if isValidId(userId) && isValidId(taskId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(taskId)
+          && isVerifiedOwner(userId)
+          && isValidAgentTask(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(taskId)
+          && isVerifiedOwner(userId)
+          && isValidAgentTask(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().agentId == existing().agentId
+          && incoming().createdAt == existing().createdAt
+          && (existing().status != 'completed' && existing().status != 'failed')
+          && incoming().diff(existing()).affectedKeys().hasOnly(['output', 'providerUsed', 'modelUsed', 'status', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(taskId) && (isVerifiedOwner(userId) || isAdmin());
+      }
+
+      // --- Provider Settings ---
+      match /providerSettings/{providerId} {
+        allow get: if isValidId(userId) && isValidId(providerId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(providerId)
+          && isVerifiedOwner(userId)
+          && isValidProviderSetting(incoming(), userId);
+        allow update: if isValidId(userId) && isValidId(providerId)
+          && isVerifiedOwner(userId)
+          && isValidProviderSetting(incoming(), userId)
+          && incoming().id == existing().id
+          && incoming().userId == existing().userId
+          && incoming().provider == existing().provider
+          && incoming().createdAt == existing().createdAt
+          && incoming().diff(existing()).affectedKeys().hasOnly(['enabled', 'defaultModel', 'priority', 'timeoutMs', 'maxRetries', 'fallbackEnabled', 'updatedAt']);
+        allow delete: if isValidId(userId) && isValidId(providerId) && (isVerifiedOwner(userId) || isAdmin());
+      }
+
+      // --- Usage Records (Immutable Telemetry) ---
+      match /usageRecords/{recordId} {
+        allow get: if isValidId(userId) && isValidId(recordId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isOwner(userId) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(recordId)
+          && isVerifiedOwner(userId)
+          && isValidUsageRecord(incoming(), userId);
+        allow update: if false;
+        allow delete: if isValidId(userId) && isValidId(recordId) && isAdmin();
+      }
+    }
+  }
+}

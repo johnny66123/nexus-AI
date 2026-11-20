@@ -1,0 +1,225 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Authenticated NEXUS AI user profile and role metadata isolated to the owner.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 120 },
+        "displayName": { "type": "string", "minLength": 2, "maxLength": 60 },
+        "roleTitle": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "role": { "type": "string", "enum": ["admin", "developer", "viewer"] },
+        "status": { "type": "string", "enum": ["active", "suspended"] },
+        "defaultProvider": { "type": "string", "enum": ["auto", "google", "anthropic", "openai"] },
+        "defaultModel": { "type": "string", "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "displayName", "roleTitle", "role", "status", "createdAt", "updatedAt"]
+    },
+    "Assistant": {
+      "title": "Assistant",
+      "description": "User-owned specialized AI assistant configuration.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUserId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 2, "maxLength": 60 },
+        "description": { "type": "string", "minLength": 10, "maxLength": 240 },
+        "purpose": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "personality": { "type": "string", "minLength": 5, "maxLength": 240 },
+        "instructions": { "type": "string", "minLength": 10, "maxLength": 4000 },
+        "provider": { "type": "string", "enum": ["google", "anthropic", "openai"] },
+        "model": { "type": "string", "maxLength": 80 },
+        "isPublic": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUserId", "name", "description", "purpose", "personality", "instructions", "model", "createdAt", "updatedAt"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "User-owned conversation thread linked to an assistant.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "assistantId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "assistantId", "userId", "title", "createdAt", "updatedAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Individual message inside a user conversation.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "conversationId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["user", "model"] },
+        "content": { "type": "string", "minLength": 1, "maxLength": 16000 },
+        "providerUsed": { "type": "string", "maxLength": 40 },
+        "modelUsed": { "type": "string", "maxLength": 80 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "conversationId", "role", "content", "createdAt"]
+    },
+    "ResearchProject": {
+      "title": "ResearchProject",
+      "description": "Multi-stage research investigation and structured 9-section report.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 2, "maxLength": 160 },
+        "question": { "type": "string", "minLength": 6, "maxLength": 2000 },
+        "researchType": { "type": "string", "maxLength": 40 },
+        "visibility": { "type": "string", "enum": ["private", "workspace"] },
+        "status": { "type": "string", "enum": ["running", "completed", "completed_with_warnings", "incomplete_search_failed", "failed"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "title", "question", "researchType", "visibility", "status", "createdAt", "updatedAt"]
+    },
+    "ResearchSource": {
+      "title": "ResearchSource",
+      "description": "Verified citation source attached to a research project.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "projectId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "citationKey": { "type": "string", "maxLength": 16 },
+        "title": { "type": "string", "maxLength": 300 },
+        "url": { "type": "string", "maxLength": 1000 },
+        "reliabilityTier": { "type": "string", "enum": ["high", "moderate", "low", "unknown"] },
+        "savedToLibrary": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "projectId", "userId", "citationKey", "title", "url", "reliabilityTier", "savedToLibrary", "createdAt"]
+    },
+    "SpecialistAgent": {
+      "title": "SpecialistAgent",
+      "description": "Configurable specialist agent with dedicated instructions and permissions.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "roleKey": { "type": "string", "enum": ["research", "analysis", "fact_check", "academic", "writing", "coding"] },
+        "name": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "description": { "type": "string", "minLength": 5, "maxLength": 300 },
+        "instructions": { "type": "string", "minLength": 10, "maxLength": 4000 },
+        "preferredProvider": { "type": "string", "enum": ["auto", "google", "anthropic", "openai"] },
+        "preferredModel": { "type": "string", "maxLength": 80 },
+        "enabled": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "roleKey", "name", "description", "instructions", "preferredProvider", "preferredModel", "enabled", "createdAt", "updatedAt"]
+    },
+    "AgentTask": {
+      "title": "AgentTask",
+      "description": "Execution history record for a specialist agent task.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "agentId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "title": { "type": "string", "minLength": 2, "maxLength": 160 },
+        "inputPrompt": { "type": "string", "minLength": 1, "maxLength": 8000 },
+        "output": { "type": "string", "maxLength": 20000 },
+        "providerUsed": { "type": "string", "maxLength": 40 },
+        "modelUsed": { "type": "string", "maxLength": 80 },
+        "status": { "type": "string", "enum": ["pending", "running", "completed", "failed", "awaiting_approval"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "agentId", "title", "inputPrompt", "status", "createdAt", "updatedAt"]
+    },
+    "ProviderSetting": {
+      "title": "ProviderSetting",
+      "description": "User-scoped Model Gateway provider configuration (no secret keys).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 64, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "provider": { "type": "string", "enum": ["google", "anthropic", "openai"] },
+        "enabled": { "type": "boolean" },
+        "defaultModel": { "type": "string", "maxLength": 80 },
+        "priority": { "type": "integer" },
+        "timeoutMs": { "type": "integer" },
+        "maxRetries": { "type": "integer" },
+        "fallbackEnabled": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "provider", "enabled", "defaultModel", "priority", "timeoutMs", "maxRetries", "fallbackEnabled", "createdAt", "updatedAt"]
+    },
+    "UsageRecord": {
+      "title": "UsageRecord",
+      "description": "Model Gateway token, latency, and fallback telemetry record.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "userId": { "type": "string", "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "provider": { "type": "string", "enum": ["google", "anthropic", "openai"] },
+        "model": { "type": "string", "maxLength": 80 },
+        "taskType": { "type": "string", "maxLength": 40 },
+        "status": { "type": "string", "enum": ["success", "fallback_success", "error"] },
+        "inputTokens": { "type": "integer" },
+        "outputTokens": { "type": "integer" },
+        "totalTokens": { "type": "integer" },
+        "latencyMs": { "type": "integer" },
+        "fallbackUsed": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "userId", "provider", "model", "taskType", "status", "totalTokens", "latencyMs", "fallbackUsed", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserAccount" },
+      "description": "Private user account profile isolated to owner."
+    },
+    "/users/{userId}/assistants/{assistantId}": {
+      "schema": { "$ref": "#/entities/Assistant" },
+      "description": "Assistants created or owned by the user."
+    },
+    "/users/{userId}/conversations/{conversationId}": {
+      "schema": { "$ref": "#/entities/Conversation" },
+      "description": "Conversation threads isolated to the owning user."
+    },
+    "/users/{userId}/conversations/{conversationId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/Message" },
+      "description": "Chat messages scoped to a conversation and owner."
+    },
+    "/users/{userId}/researchProjects/{projectId}": {
+      "schema": { "$ref": "#/entities/ResearchProject" },
+      "description": "Research projects and reports belonging to the user."
+    },
+    "/users/{userId}/researchSources/{sourceId}": {
+      "schema": { "$ref": "#/entities/ResearchSource" },
+      "description": "Sources and citation library records belonging to the user."
+    },
+    "/users/{userId}/specialistAgents/{agentId}": {
+      "schema": { "$ref": "#/entities/SpecialistAgent" },
+      "description": "Configurable v3.0 specialist agents belonging to the user."
+    },
+    "/users/{userId}/agentTasks/{taskId}": {
+      "schema": { "$ref": "#/entities/AgentTask" },
+      "description": "Task execution history for specialist agents."
+    },
+    "/users/{userId}/providerSettings/{providerId}": {
+      "schema": { "$ref": "#/entities/ProviderSetting" },
+      "description": "User Model Gateway provider routing settings."
+    },
+    "/users/{userId}/usageRecords/{recordId}": {
+      "schema": { "$ref": "#/entities/UsageRecord" },
+      "description": "Model Gateway usage, token, and latency telemetry."
+    }
+  }
+}

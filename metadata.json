@@ -1,0 +1,6 @@
+{
+  "name": "NEXUS AI",
+  "description": "Modular AI operating platform for building specialized assistants, multi-agent orchestration, long-term memory, grounded research, development lab, automation, and knowledge workflows.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
