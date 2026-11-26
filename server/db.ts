@@ -1,8 +1,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import type { DatabaseSync as NodeDatabaseSync } from 'node:sqlite';
 import { WORKSPACE_LIMITS } from '../shared/schema.ts';
 import type {
   AgentTask,
@@ -128,12 +129,29 @@ interface LegacyJsonStore {
   };
 }
 
+function loadDatabaseSyncConstructor(): typeof NodeDatabaseSync {
+  try {
+    const req = createRequire(import.meta.url);
+    const sqliteMod = req('node:sqlite') as { DatabaseSync?: typeof NodeDatabaseSync };
+    if (!sqliteMod?.DatabaseSync) {
+      throw new Error('DatabaseSync export is missing from node:sqlite.');
+    }
+    return sqliteMod.DatabaseSync;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `NEVUS AI requires Node.js >= 22.13 (found ${process.version}) with built-in node:sqlite support. Underlying error: ${detail}`,
+    );
+  }
+}
+
 export class NexusDatabaseService {
-  private db: DatabaseSync;
+  private db: NodeDatabaseSync;
   public readonly storageMode: 'local-sqlite' | 'ephemeral-sqlite' | 'memory';
   public readonly resolvedDbPath: string;
 
   constructor(dbPath?: string) {
+    const DatabaseSyncCtor = loadDatabaseSyncConstructor();
     let resolvedPath =
       dbPath ??
       process.env.NEXUS_DB_PATH ??
@@ -159,10 +177,41 @@ export class NexusDatabaseService {
       }
     }
 
+    try {
+      this.db = new DatabaseSyncCtor(resolvedPath);
+      if (resolvedPath !== ':memory:') {
+        this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
+      } else {
+        this.db.exec('PRAGMA foreign_keys = ON;');
+      }
+    } catch (openErr) {
+      console.warn(
+        '[NEVUS DB] Primary SQLite open failed, recovering with clean ephemeral store:',
+        openErr instanceof Error ? openErr.message : String(openErr),
+      );
+      if (resolvedPath !== ':memory:') {
+        for (const suffix of ['', '-wal', '-shm']) {
+          try {
+            if (fs.existsSync(`${resolvedPath}${suffix}`)) {
+              fs.unlinkSync(`${resolvedPath}${suffix}`);
+            }
+          } catch {
+            // Ignore cleanup failure
+          }
+        }
+      }
+      try {
+        resolvedPath = ':memory:';
+        mode = 'memory';
+        this.db = new DatabaseSyncCtor(':memory:');
+        this.db.exec('PRAGMA foreign_keys = ON;');
+      } catch (memErr) {
+        throw memErr;
+      }
+    }
+
     this.resolvedDbPath = resolvedPath;
     this.storageMode = mode;
-    this.db = new DatabaseSync(resolvedPath);
-    this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.initSchema();
     this.seedIfEmpty();
     this.seedIntelligenceStarterOnce();
@@ -1209,6 +1258,16 @@ export class NexusDatabaseService {
     const updated = this.getUserById(userId);
     if (updated) syncUserToFirestore(updated);
     return updated;
+  }
+
+  deleteUserForRollback(userId: string): void {
+    try {
+      this.db.prepare('DELETE FROM provider_settings WHERE user_id = ?').run(userId);
+      this.db.prepare('DELETE FROM specialist_agents WHERE user_id = ?').run(userId);
+      this.db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+    } catch {
+      // Ignore rollback cleanup failure
+    }
   }
 
   getProfileForUser(userId: string): UserProfile | null {
@@ -2797,14 +2856,14 @@ export class NexusDatabaseService {
       'SELECT id FROM provider_settings WHERE user_id = ? AND provider = ?',
     );
     const insertProv = this.db.prepare(`
-      INSERT INTO provider_settings (
+      INSERT OR IGNORE INTO provider_settings (
         id, user_id, provider, enabled, default_model, priority, timeout_ms, max_retries, fallback_enabled, created_at, updated_at
       ) VALUES (?, ?, ?, 1, ?, ?, ?, 2, 1, ?, ?)
     `);
 
     for (const p of defaultProviders) {
       if (!checkProv.get(userId, p.provider)) {
-        const id = `prov-${userId.slice(0, 10)}-${p.provider}`;
+        const id = `prov-${userId}-${p.provider}`;
         insertProv.run(id, userId, p.provider, p.defaultModel, p.priority, p.timeoutMs, now, now);
       }
     }
@@ -3439,19 +3498,33 @@ export class NexusDatabaseService {
       'google_connections',
     ];
 
-    this.db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    let inTransaction = false;
+    this.db.exec('PRAGMA foreign_keys = OFF;');
     try {
+      this.db.exec('BEGIN IMMEDIATE;');
+      inTransaction = true;
+
       for (const table of [...tableOrder].reverse()) {
-        if (Array.isArray(snapshot.tables[table])) {
-          this.db.exec(`DELETE FROM ${table}`);
-        }
+        const rows = snapshot.tables[table];
+        if (!Array.isArray(rows)) continue;
+        // Never wipe seeded baseline users if snapshot contains an empty users array
+        if (table === 'users' && rows.length === 0) continue;
+        this.db.exec(`DELETE FROM ${table}`);
       }
 
       for (const table of tableOrder) {
         const rows = snapshot.tables[table];
         if (!Array.isArray(rows) || rows.length === 0) continue;
+        const validCols = new Set(
+          (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+            (c) => c.name,
+          ),
+        );
         for (const row of rows) {
-          const cols = Object.keys(row).filter((k) => /^[a-zA-Z0-9_]+$/.test(k));
+          if (!row || typeof row !== 'object') continue;
+          const cols = Object.keys(row).filter(
+            (k) => /^[a-zA-Z0-9_]+$/.test(k) && validCols.has(k),
+          );
           if (cols.length === 0) continue;
           const placeholders = cols.map(() => '?').join(', ');
           const sql = `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`;
@@ -3468,8 +3541,20 @@ export class NexusDatabaseService {
         }
       }
       this.db.exec('COMMIT; PRAGMA foreign_keys = ON;');
+      inTransaction = false;
     } catch (err) {
-      this.db.exec('ROLLBACK; PRAGMA foreign_keys = ON;');
+      if (inTransaction) {
+        try {
+          this.db.exec('ROLLBACK;');
+        } catch {
+          // Ignore rollback errors if transaction already closed
+        }
+      }
+      try {
+        this.db.exec('PRAGMA foreign_keys = ON;');
+      } catch {
+        // Ignore
+      }
       throw err;
     }
   }

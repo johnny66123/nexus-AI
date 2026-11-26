@@ -2,7 +2,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import { db } from './db.ts';
 import type { GoogleConnectionRecord } from './db.ts';
 import { runGroundedResearch } from './gemini.ts';
-import { signOAuthState, verifyOAuthState } from './security.ts';
+import { getAppUrlDiagnostics, signOAuthState, verifyOAuthState } from './security.ts';
 
 export type GoogleServiceId =
   | 'search'
@@ -204,15 +204,9 @@ export function resolveGoogleOAuthRedirectUri(requestOrigin?: string): string {
   if (process.env.GOOGLE_OAUTH_REDIRECT_URI?.trim()) {
     return process.env.GOOGLE_OAUTH_REDIRECT_URI.trim();
   }
-  const appUrl = process.env.APP_URL?.trim();
-  if (appUrl && appUrl !== 'MY_APP_URL') {
-    return `${appUrl.replace(/\/$/, '')}/api/google/oauth/callback`;
-  }
-  if (process.env.VERCEL_URL?.trim()) {
-    return `https://${process.env.VERCEL_URL.trim()}/api/google/oauth/callback`;
-  }
-  if (requestOrigin) {
-    return `${requestOrigin.replace(/\/$/, '')}/api/google/oauth/callback`;
+  const appDiag = getAppUrlDiagnostics(requestOrigin);
+  if (appDiag.appUrl) {
+    return `${appDiag.appUrl}/api/google/oauth/callback`;
   }
   return 'http://localhost:3000/api/google/oauth/callback';
 }

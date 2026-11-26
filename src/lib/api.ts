@@ -65,8 +65,29 @@ export interface HealthStatus {
   version: string;
   platform?: string;
   runtime?: string;
+  nodeVersion?: string;
   databaseBackend?: string;
   sessionSecretConfigured?: boolean;
+  sessionSecret?: {
+    configured: boolean;
+    source: string;
+    meetsRecommendedLength: boolean;
+  };
+  appUrlConfigured?: boolean;
+  appUrl?: string | null;
+  supabase?: {
+    configured: boolean;
+    validUrl: boolean;
+    connected: boolean;
+    tables: {
+      nevus_workspace_snapshots: boolean;
+      nevus_users: boolean;
+    };
+    error?: string;
+    checkedAt?: string;
+  };
+  cloudHydrationError?: string | null;
+  envWarnings?: string[];
   googleOAuthConfigured?: boolean;
   googleMapsConfigured?: boolean;
   apiKeyConfigured: boolean;

@@ -40,9 +40,12 @@ import {
   ensureCloudHydrated,
   flushCloudPersistence,
   getActiveDatabaseBackend,
+  getLastCloudHydrationError,
+  isSupabaseConfigured,
+  syncUserToSupabase,
+  verifySupabaseConnectivity,
 } from './server/cloudPersistence.ts';
 import { db } from './server/db.ts';
-import { generateResearchDocxBuffer, generateResearchPdfBuffer } from './server/exporters.ts';
 import { getFirebaseProjectInfo, verifyFirebaseIdToken } from './server/firestore.ts';
 import {
   GatewayProviderError,
@@ -70,14 +73,17 @@ import {
 } from './server/googleServices.ts';
 import type { GoogleServiceId } from './server/googleServices.ts';
 import { createInitialPipelineStages, runIntelligenceInvestigation } from './server/intelligence.ts';
-import { chunkText, extractDocumentText } from './server/knowledge.ts';
 import { masterIntelligence } from './server/master.ts';
 import { executeSandboxedJavaScript } from './server/sandbox.ts';
 import {
   createRateLimiter,
+  getAppUrlDiagnostics,
+  getSessionSecretDiagnostics,
   hasPersistentSessionSecret,
   inspectPromptInjection,
+  logServerError,
   parseCookies,
+  sanitizeClientErrorMessage,
   SESSION_COOKIE_NAME,
   signSessionToken,
   verifySessionToken,
@@ -96,13 +102,23 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
+function asyncHandler(
+  fn: (req: express.Request, res: express.Response, next: express.NextFunction) => unknown,
+): express.RequestHandler {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 function isHttpsRequest(req: express.Request): boolean {
   const xfProto = req.headers['x-forwarded-proto'];
   const proto = Array.isArray(xfProto) ? xfProto[0] : xfProto;
+  const appDiag = getAppUrlDiagnostics();
   return Boolean(
     req.secure ||
       (typeof proto === 'string' && proto.split(',')[0].trim().toLowerCase() === 'https') ||
-      process.env.NODE_ENV === 'production',
+      process.env.VERCEL === '1' ||
+      (appDiag.configured && appDiag.isHttps),
   );
 }
 
@@ -179,19 +195,21 @@ async function resolveAuthenticatedUser(req: express.Request): Promise<AuthUser 
   return null;
 }
 
-async function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
-  const user = await resolveAuthenticatedUser(req);
-  if (!user) {
-    clearSessionCookie(req, res);
-    res.status(401).json({
-      error: 'Authentication required. Please sign in.',
-      code: 'AUTH_REQUIRED',
-    });
-    return;
-  }
-  req.authUser = user;
-  next();
-}
+const requireAuth: express.RequestHandler = asyncHandler(
+  async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const user = await resolveAuthenticatedUser(req);
+    if (!user) {
+      clearSessionCookie(req, res);
+      res.status(401).json({
+        error: 'Authentication required. Please sign in.',
+        code: 'AUTH_REQUIRED',
+      });
+      return;
+    }
+    req.authUser = user;
+    next();
+  },
+);
 
 function requireRole(allowed: UserRole[]) {
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -223,17 +241,20 @@ export function createApp() {
   });
 
   // Cloud DB hydration & mutation flush for serverless environments (Vercel + Supabase/Firestore)
-  app.use('/api', async (req, res, next) => {
-    await ensureCloudHydrated(db);
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
-      res.on('finish', () => {
-        if (res.statusCode < 400) {
-          void flushCloudPersistence(db);
-        }
-      });
-    }
-    next();
-  });
+  app.use(
+    '/api',
+    asyncHandler(async (req, res, next) => {
+      await ensureCloudHydrated(db);
+      if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
+        res.on('finish', () => {
+          if (res.statusCode < 400) {
+            void flushCloudPersistence(db);
+          }
+        });
+      }
+      next();
+    }),
+  );
 
   const generalLimiter = createRateLimiter({
     windowMs: 60_000,
@@ -253,141 +274,233 @@ export function createApp() {
 
   app.use('/api', generalLimiter);
 
-  // Health & Capability Status (never returns keys)
-  app.get('/api/health', (_req, res) => {
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const anthropicKey = process.env.ANTHROPIC_API_KEY;
-    const openaiKey = process.env.OPENAI_API_KEY;
-    const githubToken = process.env.GITHUB_TOKEN;
-    const googleConfigured = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
-    const anthropicConfigured = Boolean(anthropicKey && anthropicKey !== 'MY_ANTHROPIC_API_KEY');
-    const openaiConfigured = Boolean(openaiKey && openaiKey !== 'MY_OPENAI_API_KEY');
+  // Health & Capability Status (never returns keys or secrets)
+  app.get(
+    '/api/health',
+    asyncHandler(async (req, res) => {
+      const geminiKey = process.env.GEMINI_API_KEY;
+      const anthropicKey = process.env.ANTHROPIC_API_KEY;
+      const openaiKey = process.env.OPENAI_API_KEY;
+      const githubToken = process.env.GITHUB_TOKEN;
+      const googleConfigured = Boolean(geminiKey && geminiKey !== 'MY_GEMINI_API_KEY');
+      const anthropicConfigured = Boolean(anthropicKey && anthropicKey !== 'MY_ANTHROPIC_API_KEY');
+      const openaiConfigured = Boolean(openaiKey && openaiKey !== 'MY_OPENAI_API_KEY');
 
-    res.json({
-      ok: true,
-      version: '3.0',
-      platform: 'NEVUS AI',
-      runtime: process.env.VERCEL === '1' ? 'vercel-serverless' : 'node-server',
-      databaseBackend: getActiveDatabaseBackend(db),
-      sessionSecretConfigured: hasPersistentSessionSecret(),
-      googleOAuthConfigured: isGoogleOAuthClientConfigured(),
-      googleMapsConfigured: Boolean(process.env.GOOGLE_MAPS_API_KEY?.trim()),
-      apiKeyConfigured: googleConfigured,
-      providers: {
-        google: googleConfigured,
-        anthropic: anthropicConfigured,
-        openai: openaiConfigured,
-      },
-      firebase: getFirebaseProjectInfo(),
-      githubTokenConfigured: Boolean(githubToken),
-      paidImageModelAvailable: false,
-    });
-  });
+      const hostHeader = req.headers.host;
+      const originHeader = req.headers.origin;
+      const inferredOrigin =
+        typeof originHeader === 'string'
+          ? originHeader
+          : typeof hostHeader === 'string'
+            ? `${isHttpsRequest(req) ? 'https' : 'http'}://${hostHeader}`
+            : undefined;
+      const appUrlDiag = getAppUrlDiagnostics(inferredOrigin);
+      const sessionDiag = getSessionSecretDiagnostics();
+      const supabaseDiag = await verifySupabaseConnectivity(req.query.deep === '1');
+      const hydrationErr = getLastCloudHydrationError();
+
+      const envWarnings: string[] = [];
+      if (process.env.VERCEL === '1') {
+        if (!sessionDiag.configured) {
+          envWarnings.push('NEXUS_SESSION_SECRET is missing (sessions will not persist across cold starts).');
+        }
+        if (!appUrlDiag.configured || !appUrlDiag.valid) {
+          envWarnings.push(appUrlDiag.warning || 'APP_URL is missing or invalid.');
+        }
+        if (!supabaseDiag.configured && !getFirebaseProjectInfo().serviceAccountConfigured) {
+          envWarnings.push('Neither Supabase nor Firebase Service Account is configured; Vercel SQLite is ephemeral.');
+        } else if (supabaseDiag.configured && supabaseDiag.error) {
+          envWarnings.push(supabaseDiag.error);
+        }
+      }
+
+      res.json({
+        ok: true,
+        version: '3.0',
+        platform: 'NEVUS AI',
+        runtime: process.env.VERCEL === '1' ? 'vercel-serverless' : 'node-server',
+        nodeVersion: process.version,
+        databaseBackend: getActiveDatabaseBackend(db),
+        sessionSecretConfigured: sessionDiag.configured,
+        sessionSecret: sessionDiag,
+        appUrlConfigured: appUrlDiag.configured && appUrlDiag.valid,
+        appUrl: appUrlDiag.appUrl,
+        supabase: supabaseDiag,
+        cloudHydrationError: hydrationErr,
+        envWarnings,
+        googleOAuthConfigured: isGoogleOAuthClientConfigured(),
+        googleMapsConfigured: Boolean(process.env.GOOGLE_MAPS_API_KEY?.trim()),
+        apiKeyConfigured: googleConfigured,
+        providers: {
+          google: googleConfigured,
+          anthropic: anthropicConfigured,
+          openai: openaiConfigured,
+        },
+        firebase: getFirebaseProjectInfo(),
+        githubTokenConfigured: Boolean(githubToken),
+        paidImageModelAvailable: false,
+      });
+    }),
+  );
 
   // --- Authentication Routes ---
-  app.get('/api/auth/session', async (req, res) => {
-    const user = await resolveAuthenticatedUser(req);
-    if (!user) {
-      res.json({ authenticated: false, user: null });
-      return;
-    }
-    const sessionToken = signSessionToken(user.id, user.role);
-    res.json({ authenticated: true, user, sessionToken });
-  });
-
-  app.post('/api/auth/firebase', authLimiter, async (req, res) => {
-    const schema = z.object({ idToken: z.string().trim().min(10) });
-    const parsed = schema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: 'Valid Firebase ID token is required.' });
-      return;
-    }
-    try {
-      const decoded = await verifyFirebaseIdToken(parsed.data.idToken);
-      if (!decoded.uid || !decoded.email) {
-        res.status(400).json({ error: 'Firebase token must include verified email.' });
+  app.get(
+    '/api/auth/session',
+    asyncHandler(async (req, res) => {
+      const user = await resolveAuthenticatedUser(req);
+      if (!user) {
+        res.json({ authenticated: false, user: null });
         return;
       }
-      const user = db.upsertFirebaseUser({
-        uid: decoded.uid,
-        email: decoded.email,
-        displayName: decoded.name || decoded.email.split('@')[0],
-      });
-      if (user.status !== 'active') {
-        res.status(403).json({ error: 'Account is suspended.' });
+      const sessionToken = signSessionToken(user.id, user.role);
+      res.json({ authenticated: true, user, sessionToken });
+    }),
+  );
+
+  app.post(
+    '/api/auth/firebase',
+    authLimiter,
+    asyncHandler(async (req, res) => {
+      const schema = z.object({ idToken: z.string().trim().min(10) });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Valid Firebase ID token is required.' });
+        return;
+      }
+      try {
+        const decoded = await verifyFirebaseIdToken(parsed.data.idToken);
+        if (!decoded.uid || !decoded.email) {
+          res.status(400).json({ error: 'Firebase token must include verified email.' });
+          return;
+        }
+        const user = db.upsertFirebaseUser({
+          uid: decoded.uid,
+          email: decoded.email,
+          displayName: decoded.name || decoded.email.split('@')[0],
+        });
+        if (user.status !== 'active') {
+          res.status(403).json({ error: 'Account is suspended.' });
+          return;
+        }
+        const sessionToken = setSessionCookie(req, res, user);
+        db.addAuditLog({
+          userId: user.id,
+          userEmail: user.email,
+          action: 'auth.firebase_login',
+          resourceType: 'session',
+          resourceId: user.id,
+          details: `Signed in via Firebase Auth (${user.role})`,
+        });
+        await Promise.allSettled([syncUserToSupabase(user), flushCloudPersistence(db)]);
+        res.json({ user, sessionToken });
+      } catch (err) {
+        logServerError('auth.firebase', err, { method: req.method, path: req.path });
+        res.status(401).json({
+          error:
+            err instanceof Error
+              ? `Firebase authentication verification failed: ${sanitizeClientErrorMessage(err, 'Invalid Firebase token.')}`
+              : 'Invalid Firebase token.',
+        });
+      }
+    }),
+  );
+
+  app.post(
+    '/api/auth/login',
+    authLimiter,
+    asyncHandler(async (req, res) => {
+      const parsed = loginSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid credentials.' });
+        return;
+      }
+      const user = db.authenticateUser(parsed.data.email, parsed.data.password);
+      if (!user) {
+        res.status(401).json({ error: 'Invalid email or password, or account suspended.' });
         return;
       }
       const sessionToken = setSessionCookie(req, res, user);
       db.addAuditLog({
         userId: user.id,
         userEmail: user.email,
-        action: 'auth.firebase_login',
+        action: 'auth.login',
         resourceType: 'session',
         resourceId: user.id,
-        details: `Signed in via Firebase Auth (${user.role})`,
+        details: `Signed in with role ${user.role}`,
       });
+      await flushCloudPersistence(db);
       res.json({ user, sessionToken });
-    } catch (err) {
-      res.status(401).json({
-        error:
-          err instanceof Error
-            ? `Firebase authentication verification failed: ${err.message}`
-            : 'Invalid Firebase token.',
-      });
-    }
-  });
+    }),
+  );
 
-  app.post('/api/auth/login', authLimiter, (req, res) => {
-    const parsed = loginSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid credentials.' });
-      return;
-    }
-    const user = db.authenticateUser(parsed.data.email, parsed.data.password);
-    if (!user) {
-      res.status(401).json({ error: 'Invalid email or password, or account suspended.' });
-      return;
-    }
-    const sessionToken = setSessionCookie(req, res, user);
-    db.addAuditLog({
-      userId: user.id,
-      userEmail: user.email,
-      action: 'auth.login',
-      resourceType: 'session',
-      resourceId: user.id,
-      details: `Signed in with role ${user.role}`,
-    });
-    res.json({ user, sessionToken });
-  });
+  app.post(
+    '/api/auth/register',
+    authLimiter,
+    asyncHandler(async (req, res) => {
+      const parsed = registerSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid registration data.' });
+        return;
+      }
 
-  app.post('/api/auth/register', authLimiter, (req, res) => {
-    const parsed = registerSchema.safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message ?? 'Invalid registration data.' });
-      return;
-    }
-    try {
-      const user = db.registerUser({
-        email: parsed.data.email,
-        password: parsed.data.password,
-        displayName: parsed.data.displayName,
-        roleTitle: parsed.data.roleTitle,
-        role: 'developer',
-      });
-      const sessionToken = setSessionCookie(req, res, user);
-      db.addAuditLog({
-        userId: user.id,
-        userEmail: user.email,
-        action: 'auth.register',
-        resourceType: 'user',
-        resourceId: user.id,
-        details: 'New developer account created',
-      });
-      res.status(201).json({ user, sessionToken });
-    } catch (err) {
-      res.status(409).json({ error: err instanceof Error ? err.message : 'Registration failed.' });
-    }
-  });
+      let user: AuthUser;
+      try {
+        user = db.registerUser({
+          email: parsed.data.email,
+          password: parsed.data.password,
+          displayName: parsed.data.displayName,
+          roleTitle: parsed.data.roleTitle,
+          role: 'developer',
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (msg.toLowerCase().includes('already exists')) {
+          res.status(409).json({ error: 'An account with this email already exists.', code: 'EMAIL_EXISTS' });
+          return;
+        }
+        logServerError('auth.register.db', err, { method: req.method, path: req.path });
+        res.status(500).json({
+          error: sanitizeClientErrorMessage(err, 'Unable to create workspace account due to a server database error.'),
+          code: 'REGISTRATION_DB_ERROR',
+        });
+        return;
+      }
+
+      try {
+        const sessionToken = setSessionCookie(req, res, user);
+        db.addAuditLog({
+          userId: user.id,
+          userEmail: user.email,
+          action: 'auth.register',
+          resourceType: 'user',
+          resourceId: user.id,
+          details: 'New developer account created',
+        });
+
+        // On Vercel serverless, flush snapshot & user row BEFORE returning 201 so the lambda does not freeze mid-sync
+        if (isSupabaseConfigured()) {
+          await syncUserToSupabase(user);
+          await flushCloudPersistence(db, { throwOnError: process.env.VERCEL === '1' });
+        } else {
+          await flushCloudPersistence(db);
+        }
+
+        res.status(201).json({ user, sessionToken });
+      } catch (err) {
+        db.deleteUserForRollback(user.id);
+        logServerError('auth.register.persist', err, {
+          method: req.method,
+          path: req.path,
+          extra: { userId: user.id },
+        });
+        res.status(500).json({
+          error:
+            'Account could not be persisted to the cloud database. Verify SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and run supabase/schema.sql.',
+          code: 'CLOUD_PERSISTENCE_ERROR',
+        });
+      }
+    }),
+  );
 
   app.post('/api/auth/logout', (req, res) => {
     clearSessionCookie(req, res);
@@ -1028,6 +1141,7 @@ export function createApp() {
       }
 
       try {
+        const { chunkText, extractDocumentText } = await import('./server/knowledge.ts');
         const { text, fileType } = await extractDocumentText(
           req.file.buffer,
           req.file.originalname,
@@ -1534,6 +1648,7 @@ export function createApp() {
 
     try {
       if (format === 'pdf') {
+        const { generateResearchPdfBuffer } = await import('./server/exporters.ts');
         const pdfBuf = await generateResearchPdfBuffer(project);
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `attachment; filename="nexus-${safeSlug}.pdf"`);
@@ -1541,6 +1656,7 @@ export function createApp() {
         return;
       }
       if (format === 'docx') {
+        const { generateResearchDocxBuffer } = await import('./server/exporters.ts');
         const docxBuf = await generateResearchDocxBuffer(project);
         res.setHeader(
           'Content-Type',
@@ -2791,9 +2907,15 @@ export function createApp() {
     res.status(404).json({ error: 'API endpoint not found.' });
   });
 
-  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    const message = err instanceof Error ? err.message : 'Internal server error.';
-    res.status(500).json({ error: message });
+  app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    logServerError('express.unhandled', err, {
+      method: req.method,
+      path: req.path,
+      statusCode: 500,
+    });
+    if (res.headersSent) return;
+    const message = sanitizeClientErrorMessage(err, 'Internal server error.');
+    res.status(500).json({ error: message, code: 'INTERNAL_SERVER_ERROR' });
   });
 
   return app;

@@ -109,6 +109,10 @@ export function AuthGateView({ onAuthenticated, initialNotice = null }: AuthGate
             onClick={() => {
               setMode('register');
               setError(null);
+              if (email === 'admin@nexus.ai' && password === 'nexus-admin-2026') {
+                setEmail('');
+                setPassword('');
+              }
             }}
             className={`flex-1 rounded-md py-2 text-xs font-medium transition-colors cursor-pointer ${
               mode === 'register' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'
@@ -149,6 +153,8 @@ export function AuthGateView({ onAuthenticated, initialNotice = null }: AuthGate
                   id="auth-name"
                   type="text"
                   required
+                  minLength={2}
+                  maxLength={60}
                   value={displayName}
                   onChange={(e) => setDisplayName(e.target.value)}
                   placeholder="Alex Mercer"
@@ -163,6 +169,8 @@ export function AuthGateView({ onAuthenticated, initialNotice = null }: AuthGate
                   id="auth-title"
                   type="text"
                   required
+                  minLength={2}
+                  maxLength={80}
                   value={roleTitle}
                   onChange={(e) => setRoleTitle(e.target.value)}
                   className="w-full rounded-lg border border-slate-800 bg-[#060913] px-3.5 py-2.5 text-sm text-white focus:border-blue-500 focus:outline-none"
@@ -181,20 +189,29 @@ export function AuthGateView({ onAuthenticated, initialNotice = null }: AuthGate
               required
               value={email}
               onChange={(e) => setEmail(e.target.value)}
+              placeholder="you@company.com"
               className="w-full rounded-lg border border-slate-800 bg-[#060913] px-3.5 py-2.5 text-sm text-white focus:border-blue-500 focus:outline-none"
             />
           </div>
 
           <div className="space-y-1.5">
-            <label htmlFor="auth-password" className="text-xs font-medium text-slate-300">
-              Password
-            </label>
+            <div className="flex items-center justify-between">
+              <label htmlFor="auth-password" className="text-xs font-medium text-slate-300">
+                Password
+              </label>
+              {mode === 'register' && (
+                <span className="text-[11px] text-slate-500">Minimum 8 characters</span>
+              )}
+            </div>
             <input
               id="auth-password"
               type="password"
               required
+              minLength={mode === 'register' ? 8 : 6}
+              maxLength={100}
               value={password}
               onChange={(e) => setPassword(e.target.value)}
+              placeholder={mode === 'register' ? 'Create a strong password' : 'Enter password'}
               className="w-full rounded-lg border border-slate-800 bg-[#060913] px-3.5 py-2.5 text-sm text-white focus:border-blue-500 focus:outline-none"
             />
           </div>

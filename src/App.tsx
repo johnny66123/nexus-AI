@@ -205,6 +205,12 @@ export default function App() {
       } catch (err) {
         if (err instanceof UnauthorizedError) {
           resetAuthState(err.message);
+        } else {
+          const msg =
+            err instanceof Error
+              ? err.message
+              : 'Unable to reach workspace authentication service.';
+          resetAuthState(msg);
         }
       } finally {
         setAuthChecking(false);

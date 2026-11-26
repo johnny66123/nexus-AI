@@ -990,3 +990,137 @@ test('Vercel & Google Ecosystem: encryption, OAuth CSRF state, health readiness,
     }
   }
 });
+
+test('Vercel registration hardening: duplicate 409, scrypt login, APP_URL/secret checks, Supabase table verification, redaction & serverless handler', async () => {
+  const {
+    getAppUrlDiagnostics,
+    getSessionSecretDiagnostics,
+    redactSensitiveText,
+    sanitizeClientErrorMessage,
+  } = await import('../server/security.ts');
+  const { verifySupabaseConnectivity } = await import('../server/cloudPersistence.ts');
+
+  // 1. Secret redaction & error sanitization never leak API keys/secrets
+  const leaked =
+    'Failure with AIzaSyDummySecretKeyValue12345678 and Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig and secret=top_secret_val';
+  const redacted = redactSensitiveText(leaked);
+  assert.equal(redacted.includes('AIzaSyDummySecretKeyValue12345678'), false);
+  assert.equal(redacted.includes('top_secret_val'), false);
+  assert.equal(
+    sanitizeClientErrorMessage(new Error('SqliteError: SELECT * FROM users at /var/task/db.ts'), 'Safe fallback'),
+    'Safe fallback',
+  );
+
+  // 2. NEXUS_SESSION_SECRET diagnostics
+  const secretDiag = getSessionSecretDiagnostics();
+  assert.equal(secretDiag.configured, true);
+  assert.equal(secretDiag.meetsRecommendedLength, true);
+
+  // 3. APP_URL diagnostics normalization
+  const prevAppUrl = process.env.APP_URL;
+  process.env.APP_URL = 'https://nevus-ai.vercel.app/';
+  try {
+    const appDiag = getAppUrlDiagnostics();
+    assert.equal(appDiag.configured, true);
+    assert.equal(appDiag.valid, true);
+    assert.equal(appDiag.appUrl, 'https://nevus-ai.vercel.app');
+    assert.equal(appDiag.isHttps, true);
+  } finally {
+    if (prevAppUrl === undefined) delete process.env.APP_URL;
+    else process.env.APP_URL = prevAppUrl;
+  }
+
+  // 4. Registration + duplicate email 409 + scrypt login + session verification
+  const email = `vercel-reg-${Date.now()}@nexus.ai`;
+  const password = 'vercel-strong-pass-2026';
+  const reg1 = await apiRequest('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Forwarded-Proto': 'https' },
+    body: JSON.stringify({
+      email,
+      password,
+      displayName: 'Vercel Prod User',
+      roleTitle: 'Cloud Architect',
+    }),
+  });
+  assert.equal(reg1.status, 201);
+  assert.equal(reg1.data.user.email, email);
+  assert.ok(reg1.data.sessionToken);
+
+  const regDup = await apiRequest('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      email,
+      password,
+      displayName: 'Duplicate User',
+      roleTitle: 'Cloud Architect',
+    }),
+  });
+  assert.equal(regDup.status, 409);
+  assert.equal(regDup.data.code, 'EMAIL_EXISTS');
+
+  const loginOk = await apiRequest('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  assert.equal(loginOk.status, 200);
+  assert.equal(loginOk.data.user.email, email);
+
+  const loginBad = await apiRequest('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email, password: 'wrong-password-123' }),
+  });
+  assert.equal(loginBad.status, 401);
+
+  // 5. Supabase connectivity & table verification (mocked PostgREST responses)
+  const prevSupaUrl = process.env.SUPABASE_URL;
+  const prevSupaKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const origFetch = globalThis.fetch;
+  try {
+    process.env.SUPABASE_URL = 'https://example-proj.supabase.co';
+    process.env.SUPABASE_SERVICE_ROLE_KEY = 'sb-test-service-role-secret-value';
+
+    // Case A: Both required tables exist
+    globalThis.fetch = (async () => new Response('[]', { status: 200 })) as typeof fetch;
+    const healthySupa = await verifySupabaseConnectivity(true);
+    assert.equal(healthySupa.configured, true);
+    assert.equal(healthySupa.connected, true);
+    assert.equal(healthySupa.tables.nevus_workspace_snapshots, true);
+    assert.equal(healthySupa.tables.nevus_users, true);
+
+    // Case B: Missing nevus_users table (404) produces actionable error without exposing key
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const target = String(input);
+      if (target.includes('nevus_users')) {
+        return new Response('{"code":"PGRST205"}', { status: 404 });
+      }
+      return new Response('[]', { status: 200 });
+    }) as typeof fetch;
+    const missingTableSupa = await verifySupabaseConnectivity(true);
+    assert.equal(missingTableSupa.tables.nevus_workspace_snapshots, true);
+    assert.equal(missingTableSupa.tables.nevus_users, false);
+    assert.ok(missingTableSupa.error?.includes('supabase/schema.sql'));
+    assert.equal(missingTableSupa.error?.includes('sb-test-service-role-secret-value'), false);
+  } finally {
+    globalThis.fetch = origFetch;
+    if (prevSupaUrl === undefined) delete process.env.SUPABASE_URL;
+    else process.env.SUPABASE_URL = prevSupaUrl;
+    if (prevSupaKey === undefined) delete process.env.SUPABASE_SERVICE_ROLE_KEY;
+    else process.env.SUPABASE_SERVICE_ROLE_KEY = prevSupaKey;
+  }
+
+  // 6. Verify Vercel handler (api/index.ts) dispatches cleanly in VERCEL=1 simulation
+  const prevVercel = process.env.VERCEL;
+  process.env.VERCEL = '1';
+  try {
+    const vercelMod = await import('../api/index.ts');
+    assert.equal(typeof vercelMod.default, 'function');
+  } finally {
+    if (prevVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = prevVercel;
+  }
+});
+

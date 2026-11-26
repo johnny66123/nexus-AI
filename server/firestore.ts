@@ -1,9 +1,11 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { cert, getApps, initializeApp } from 'firebase-admin/app';
 import type { ServiceAccount } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import type { DecodedIdToken } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
-import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 import type {
   AgentTask,
   Assistant,
@@ -16,6 +18,37 @@ import type {
   SpecialistAgent,
   UsageRecord,
 } from '../shared/schema.ts';
+
+interface FirebaseAppletConfig {
+  projectId: string;
+  firestoreDatabaseId?: string;
+}
+
+function loadFirebaseConfig(): FirebaseAppletConfig {
+  const candidates = [
+    path.resolve(process.cwd(), 'firebase-applet-config.json'),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../firebase-applet-config.json'),
+  ];
+  for (const filePath of candidates) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, 'utf-8');
+        const parsed = JSON.parse(raw) as FirebaseAppletConfig;
+        if (parsed && typeof parsed.projectId === 'string') {
+          return parsed;
+        }
+      }
+    } catch {
+      // Try next candidate or env fallback
+    }
+  }
+  return {
+    projectId: process.env.FIREBASE_PROJECT_ID?.trim() || '',
+    firestoreDatabaseId: process.env.FIREBASE_DATABASE_ID?.trim() || '(default)',
+  };
+}
+
+const firebaseConfig = loadFirebaseConfig();
 
 let firestoreInitialized = false;
 
@@ -36,12 +69,14 @@ function ensureAdminApp() {
     if (serviceAccount) {
       initializeApp({
         credential: cert(serviceAccount),
-        projectId: firebaseConfig.projectId,
+        projectId: firebaseConfig.projectId || undefined,
       });
-    } else {
+    } else if (firebaseConfig.projectId) {
       initializeApp({
         projectId: firebaseConfig.projectId,
       });
+    } else {
+      initializeApp();
     }
   }
   firestoreInitialized = true;
@@ -54,7 +89,11 @@ function getAdminAuthInstance() {
 
 export function getAdminDbInstance() {
   ensureAdminApp();
-  return getFirestore(getApps()[0], firebaseConfig.firestoreDatabaseId);
+  const dbId = firebaseConfig.firestoreDatabaseId;
+  if (dbId && dbId !== '(default)') {
+    return getFirestore(getApps()[0], dbId);
+  }
+  return getFirestore(getApps()[0]);
 }
 
 export function hasFirebaseServiceAccount(): boolean {
@@ -66,7 +105,14 @@ function isCloudSyncEnabled(): boolean {
   if (process.env.NODE_ENV === 'test' || process.env.NEXUS_DB_PATH?.includes('nexus-test-')) {
     return false;
   }
-  return Boolean(firebaseConfig.projectId && firebaseConfig.projectId !== 'remixed-project-id');
+  if (!firebaseConfig.projectId || firebaseConfig.projectId === 'remixed-project-id') {
+    return false;
+  }
+  // On Vercel or environments without service account credentials, avoid noisy PERMISSION_DENIED writes
+  if (!hasFirebaseServiceAccount() && (process.env.VERCEL === '1' || !process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
+    return false;
+  }
+  return true;
 }
 
 export async function verifyFirebaseIdToken(idToken: string): Promise<DecodedIdToken> {
@@ -78,7 +124,7 @@ export function getFirebaseProjectInfo() {
   return {
     configured: Boolean(firebaseConfig.projectId && firebaseConfig.projectId !== 'remixed-project-id'),
     projectId: firebaseConfig.projectId,
-    databaseId: firebaseConfig.firestoreDatabaseId,
+    databaseId: firebaseConfig.firestoreDatabaseId ?? '(default)',
     initialized: firestoreInitialized,
     serviceAccountConfigured: hasFirebaseServiceAccount(),
   };

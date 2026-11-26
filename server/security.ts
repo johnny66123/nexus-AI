@@ -7,20 +7,52 @@ import type { UserRole } from '../shared/schema.ts';
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const SECRET_FILE = path.join(DATA_DIR, '.session-secret');
 
+function normalizeEnvValue(raw: string | undefined): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
 let sessionSecretIsPersistent = false;
+let sessionSecretSource: 'env:NEXUS_SESSION_SECRET' | 'env:SESSION_SECRET' | 'local-file' | 'ephemeral' =
+  'ephemeral';
+let sessionSecretRawLength = 0;
 
 function resolveSessionSecret(): string {
-  const envSecret = process.env.NEXUS_SESSION_SECRET || process.env.SESSION_SECRET;
+  const nexusSecret = normalizeEnvValue(process.env.NEXUS_SESSION_SECRET);
+  const legacySecret = normalizeEnvValue(process.env.SESSION_SECRET);
+  const envSecret = nexusSecret || legacySecret;
   if (envSecret && envSecret.length >= 16) {
     sessionSecretIsPersistent = true;
+    sessionSecretSource = nexusSecret ? 'env:NEXUS_SESSION_SECRET' : 'env:SESSION_SECRET';
+    sessionSecretRawLength = envSecret.length;
+    if (envSecret.length < 32 && process.env.NODE_ENV !== 'test') {
+      console.warn(
+        '[NEVUS Security] Session secret is shorter than 32 characters. Recommend generating a 64-char hex secret.',
+      );
+    }
     return envSecret;
+  }
+
+  if (envSecret && envSecret.length > 0 && envSecret.length < 16) {
+    console.warn(
+      '[NEVUS Security] Configured NEXUS_SESSION_SECRET is shorter than 16 characters and cannot be used safely.',
+    );
   }
 
   // On Vercel or read-only serverless filesystems, never write to process.cwd()/data
   if (process.env.VERCEL === '1') {
     sessionSecretIsPersistent = false;
+    sessionSecretSource = 'ephemeral';
+    sessionSecretRawLength = 0;
     console.warn(
-      '[NEVUS Security] NEXUS_SESSION_SECRET is not configured. Using ephemeral per-instance session key; set NEXUS_SESSION_SECRET in Vercel Environment Variables for persistent sessions.',
+      '[NEVUS Security] NEXUS_SESSION_SECRET is not configured. Using ephemeral per-instance session key; set NEXUS_SESSION_SECRET (32+ chars) in Vercel Environment Variables for persistent sessions.',
     );
     return crypto.randomBytes(32).toString('hex');
   }
@@ -31,15 +63,21 @@ function resolveSessionSecret(): string {
       const existing = fs.readFileSync(SECRET_FILE, 'utf-8').trim();
       if (existing.length >= 32) {
         sessionSecretIsPersistent = true;
+        sessionSecretSource = 'local-file';
+        sessionSecretRawLength = existing.length;
         return existing;
       }
     }
     const generated = crypto.randomBytes(32).toString('hex');
     fs.writeFileSync(SECRET_FILE, generated, { mode: 0o600 });
     sessionSecretIsPersistent = true;
+    sessionSecretSource = 'local-file';
+    sessionSecretRawLength = generated.length;
     return generated;
   } catch {
     sessionSecretIsPersistent = false;
+    sessionSecretSource = 'ephemeral';
+    sessionSecretRawLength = 0;
     return crypto.randomBytes(32).toString('hex');
   }
 }
@@ -50,6 +88,92 @@ export const SESSION_COOKIE_NAME = 'nexus_session';
 
 export function hasPersistentSessionSecret(): boolean {
   return sessionSecretIsPersistent;
+}
+
+export function getSessionSecretDiagnostics(): {
+  configured: boolean;
+  source: string;
+  meetsRecommendedLength: boolean;
+} {
+  return {
+    configured: sessionSecretIsPersistent,
+    source: sessionSecretSource,
+    meetsRecommendedLength: sessionSecretRawLength >= 32,
+  };
+}
+
+export function getAppUrlDiagnostics(requestOrigin?: string): {
+  configured: boolean;
+  valid: boolean;
+  appUrl: string | null;
+  isHttps: boolean;
+  warning?: string;
+} {
+  const raw = normalizeEnvValue(process.env.APP_URL);
+  if (raw && raw !== 'MY_APP_URL') {
+    const candidate = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    try {
+      const parsed = new URL(candidate);
+      const normalized = `${parsed.origin}${parsed.pathname === '/' ? '' : parsed.pathname.replace(/\/$/, '')}`;
+      return {
+        configured: true,
+        valid: true,
+        appUrl: normalized,
+        isHttps: parsed.protocol === 'https:',
+      };
+    } catch {
+      return {
+        configured: true,
+        valid: false,
+        appUrl: null,
+        isHttps: false,
+        warning: 'APP_URL is malformed; set a full https:// URL without quotes.',
+      };
+    }
+  }
+
+  const vercelProdUrl = normalizeEnvValue(process.env.VERCEL_PROJECT_PRODUCTION_URL);
+  if (vercelProdUrl) {
+    return {
+      configured: false,
+      valid: true,
+      appUrl: `https://${vercelProdUrl.replace(/^https?:\/\//i, '').replace(/\/$/, '')}`,
+      isHttps: true,
+      warning: 'APP_URL is not explicitly set; falling back to VERCEL_PROJECT_PRODUCTION_URL.',
+    };
+  }
+
+  const vercelUrl = normalizeEnvValue(process.env.VERCEL_URL);
+  if (vercelUrl) {
+    return {
+      configured: false,
+      valid: true,
+      appUrl: `https://${vercelUrl.replace(/^https?:\/\//i, '').replace(/\/$/, '')}`,
+      isHttps: true,
+      warning: 'APP_URL is not explicitly set; falling back to VERCEL_URL.',
+    };
+  }
+
+  if (requestOrigin) {
+    const clean = requestOrigin.replace(/\/$/, '');
+    return {
+      configured: false,
+      valid: true,
+      appUrl: clean,
+      isHttps: clean.startsWith('https://'),
+    };
+  }
+
+  return {
+    configured: false,
+    valid: process.env.VERCEL !== '1',
+    appUrl: 'http://localhost:3000',
+    isHttps: false,
+    warning:
+      process.env.VERCEL === '1'
+        ? 'APP_URL is not configured in Vercel Environment Variables.'
+        : undefined,
+  };
 }
 
 export function encryptSecret(plaintext: string): string {
@@ -83,13 +207,19 @@ export function hashPassword(password: string): string {
 }
 
 export function verifyPassword(password: string, storedHash: string): boolean {
+  if (!password || !storedHash) return false;
   const parts = storedHash.split(':');
   if (parts.length !== 2) return false;
   const [salt, hexHash] = parts;
-  const derived = crypto.scryptSync(password, salt, 64);
-  const expected = Buffer.from(hexHash, 'hex');
-  if (derived.length !== expected.length) return false;
-  return crypto.timingSafeEqual(derived, expected);
+  if (!salt || !hexHash || hexHash.length % 2 !== 0) return false;
+  try {
+    const derived = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(hexHash, 'hex');
+    if (derived.length !== expected.length) return false;
+    return crypto.timingSafeEqual(derived, expected);
+  } catch {
+    return false;
+  }
 }
 
 export interface SessionPayload {
@@ -252,4 +382,63 @@ export function createRateLimiter(options: { windowMs: number; maxRequests: numb
     buckets.set(key, bucket);
     next();
   };
+}
+
+// Secret-safe structured server error logging
+const REDACTION_PATTERNS: Array<[RegExp, string]> = [
+  [/AIza[0-9A-Za-z\-_]{20,}/g, '[REDACTED_GOOGLE_KEY]'],
+  [/sk-[0-9A-Za-z\-_]{16,}/g, '[REDACTED_API_KEY]'],
+  [/Bearer\s+[0-9A-Za-z\-_.=]{12,}/gi, 'Bearer [REDACTED_TOKEN]'],
+  [/eyJ[0-9A-Za-z\-_]+\.[0-9A-Za-z\-_]+\.[0-9A-Za-z\-_]+/g, '[REDACTED_JWT]'],
+  [/(password|secret|service_role|token|api[_-]?key)\s*[:=]\s*["']?[^\s"',}]+/gi, '$1=[REDACTED]'],
+];
+
+export function redactSensitiveText(input: string): string {
+  let output = input;
+  for (const [pattern, replacement] of REDACTION_PATTERNS) {
+    output = output.replace(pattern, replacement);
+  }
+  return output;
+}
+
+export function sanitizeClientErrorMessage(err: unknown, fallback = 'Internal server error.'): string {
+  if (!(err instanceof Error)) return fallback;
+  const clean = redactSensitiveText(err.message).trim();
+  if (!clean) return fallback;
+  // Prevent exposing file paths or SQL internals in production 500 responses
+  if (/\/var\/|\/tmp\/|\/app\/|C:\\|SELECT\s+|INSERT\s+INTO|UPDATE\s+\w+\s+SET|SqliteError/i.test(clean)) {
+    return fallback;
+  }
+  return clean.slice(0, 240);
+}
+
+export function logServerError(
+  context: string,
+  err: unknown,
+  meta?: { method?: string; path?: string; statusCode?: number; extra?: Record<string, unknown> },
+): void {
+  const errObj = err instanceof Error ? err : new Error(String(err));
+  const payload = {
+    level: 'error',
+    timestamp: new Date().toISOString(),
+    context,
+    method: meta?.method,
+    path: meta?.path,
+    statusCode: meta?.statusCode,
+    errorName: errObj.name,
+    message: redactSensitiveText(errObj.message),
+    stackTop: errObj.stack
+      ? redactSensitiveText(errObj.stack.split('\n').slice(0, 4).join(' | '))
+      : undefined,
+    runtime: {
+      nodeVersion: process.version,
+      vercel: process.env.VERCEL === '1',
+      hasSessionSecret: hasPersistentSessionSecret(),
+      hasAppUrl: Boolean(normalizeEnvValue(process.env.APP_URL) && normalizeEnvValue(process.env.APP_URL) !== 'MY_APP_URL'),
+      hasSupabaseUrl: Boolean(normalizeEnvValue(process.env.SUPABASE_URL)),
+      hasSupabaseKey: Boolean(normalizeEnvValue(process.env.SUPABASE_SERVICE_ROLE_KEY)),
+    },
+    ...(meta?.extra ? { extra: meta.extra } : {}),
+  };
+  console.error('[NEVUS Server Error]', JSON.stringify(payload));
 }
