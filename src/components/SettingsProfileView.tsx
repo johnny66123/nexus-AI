@@ -17,14 +17,18 @@ import type {
   UserProfileInput,
 } from '../../shared/schema.ts';
 
+import type { HealthStatus } from '../lib/api.ts';
+
 interface SettingsProfileViewProps {
   profile: UserProfile;
+  health?: HealthStatus | null;
   onSaveProfile: (input: UserProfileInput) => Promise<void>;
   onLogout: () => Promise<void>;
 }
 
 export function SettingsProfileView({
   profile,
+  health = null,
   onSaveProfile,
   onLogout,
 }: SettingsProfileViewProps) {
@@ -352,6 +356,50 @@ export function SettingsProfileView({
           </button>
         </div>
       </form>
+
+      {health && (
+        <section className="space-y-4 rounded-xl border border-slate-800/80 bg-[#0B1120] p-6">
+          <div>
+            <h2 className="font-display text-base font-semibold text-white">
+              Vercel &amp; Cloud Readiness
+            </h2>
+            <p className="mt-0.5 text-xs text-slate-400">
+              Live server-side runtime and credential readiness (keys are never exposed to the
+              browser).
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {[
+              { label: 'Runtime Mode', value: health.runtime || 'node-server' },
+              { label: 'Database Backend', value: health.databaseBackend || 'local-sqlite' },
+              {
+                label: 'Session Secret',
+                value: health.sessionSecretConfigured ? 'Persistent' : 'Ephemeral (Set Secret)',
+              },
+              {
+                label: 'Google OAuth Client',
+                value: health.googleOAuthConfigured ? 'Configured' : 'Needs Env Vars',
+              },
+              {
+                label: 'Google Maps Proxy',
+                value: health.googleMapsConfigured ? 'Configured' : 'Needs Env Key',
+              },
+              {
+                label: 'Gemini AI Gateway',
+                value: health.apiKeyConfigured ? 'Configured' : 'Needs Env Key',
+              },
+            ].map((item) => (
+              <div
+                key={item.label}
+                className="rounded-lg border border-slate-800 bg-[#060913] px-3.5 py-2.5"
+              >
+                <p className="text-[11px] text-slate-400">{item.label}</p>
+                <p className="mt-0.5 font-mono text-xs font-medium text-slate-100">{item.value}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }

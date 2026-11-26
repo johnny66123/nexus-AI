@@ -8,12 +8,15 @@ import {
   FileText,
   Loader2,
   MessageSquarePlus,
+  Mic,
+  MicOff,
   PanelLeft,
   RotateCcw,
   Send,
   SlidersHorizontal,
   Square,
   Trash2,
+  Volume2,
   X,
 } from 'lucide-react';
 import {
@@ -33,9 +36,25 @@ import {
   extractMemoriesFromConversation,
   fetchDocuments,
   formatRelativeTime,
+  generateVoiceProject,
   streamChatMessage,
 } from '../lib/api.ts';
 import { MarkdownRenderer } from './MarkdownRenderer.tsx';
+
+interface BrowserSpeechRecognitionEvent {
+  results: ArrayLike<ArrayLike<{ transcript: string }>>;
+}
+
+interface BrowserSpeechRecognition {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  onresult: ((ev: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: ((ev: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+}
 
 interface ChatWorkspaceViewProps {
   assistants: Assistant[];
@@ -110,8 +129,14 @@ export function ChatWorkspaceView({
   const [extractingMemories, setExtractingMemories] = useState(false);
   const [mobileThreadsOpen, setMobileThreadsOpen] = useState(false);
   const [confirmDeleteThreadId, setConfirmDeleteThreadId] = useState<string | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const [voiceName, setVoiceName] = useState<'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr'>('Kore');
+  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  const [synthesizingMsgId, setSynthesizingMsgId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
+  const recognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -140,8 +165,115 @@ export function ChatWorkspaceView({
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      recognitionRef.current?.stop();
+      audioRef.current?.pause();
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+      }
     };
   }, []);
+
+  const handleToggleVoiceInput = () => {
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    const win = window as unknown as {
+      SpeechRecognition?: new () => BrowserSpeechRecognition;
+      webkitSpeechRecognition?: new () => BrowserSpeechRecognition;
+    };
+    const SpeechRec = win.SpeechRecognition || win.webkitSpeechRecognition;
+    if (!SpeechRec) {
+      setChatError(
+        'Voice input via Web Speech API is not supported in this browser. Type your message or use Media Studio audio transcription.',
+      );
+      return;
+    }
+
+    setChatError(null);
+    const recognition = new SpeechRec();
+    recognition.lang = 'en-US';
+    recognition.interimResults = false;
+    recognition.continuous = false;
+    recognition.onresult = (event) => {
+      const parts: string[] = [];
+      for (let i = 0; i < event.results.length; i++) {
+        const transcript = event.results[i]?.[0]?.transcript;
+        if (transcript) parts.push(transcript);
+      }
+      const spoken = parts.join(' ').trim();
+      if (spoken) {
+        setComposerText((prev) => (prev ? `${prev.trim()} ${spoken}` : spoken));
+      }
+    };
+    recognition.onerror = (ev) => {
+      setIsListening(false);
+      if (ev.error && ev.error !== 'no-speech' && ev.error !== 'aborted') {
+        setChatError(`Voice recognition error: ${ev.error}`);
+      }
+    };
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+    recognitionRef.current = recognition;
+    setIsListening(true);
+    recognition.start();
+  };
+
+  const handleStopVoicePlayback = () => {
+    audioRef.current?.pause();
+    audioRef.current = null;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+    setSpeakingMsgId(null);
+  };
+
+  const handleSpeakMessage = async (msgId: string, content: string) => {
+    if (speakingMsgId === msgId) {
+      handleStopVoicePlayback();
+      return;
+    }
+    handleStopVoicePlayback();
+    setChatError(null);
+    const cleanText = content.replace(/[#`*>\[\]]/g, '').trim().slice(0, 1500);
+    if (!cleanText) return;
+
+    setSynthesizingMsgId(msgId);
+    try {
+      const project = await generateVoiceProject({
+        title: `NEVUS Voice Reply`,
+        text: cleanText,
+        voiceName,
+        askAssistantFirst: false,
+      });
+      if (project.audioDataUrl) {
+        const audio = new Audio(project.audioDataUrl);
+        audioRef.current = audio;
+        setSpeakingMsgId(msgId);
+        audio.onended = () => setSpeakingMsgId(null);
+        audio.onerror = () => setSpeakingMsgId(null);
+        await audio.play();
+        return;
+      }
+    } catch {
+      // Fallback to browser SpeechSynthesis if Gemini TTS API is unavailable
+    } finally {
+      setSynthesizingMsgId(null);
+    }
+
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      const utterance = new SpeechSynthesisUtterance(cleanText);
+      utterance.onend = () => setSpeakingMsgId(null);
+      utterance.onerror = () => setSpeakingMsgId(null);
+      setSpeakingMsgId(msgId);
+      window.speechSynthesis.speak(utterance);
+    } else {
+      setChatError('Voice playback requires GEMINI_API_KEY TTS or browser SpeechSynthesis support.');
+    }
+  };
 
   const handleStopStreaming = () => {
     abortRef.current?.abort();
@@ -480,6 +612,21 @@ export function ChatWorkspaceView({
           </div>
 
           <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <select
+              aria-label="Voice Assistant TTS Voice"
+              value={voiceName}
+              onChange={(e) =>
+                setVoiceName(e.target.value as 'Kore' | 'Puck' | 'Charon' | 'Fenrir' | 'Zephyr')
+              }
+              title="Voice Assistant Playback Voice"
+              className="hidden sm:block rounded-lg border border-slate-800 bg-[#060913] px-2 py-1.5 font-mono text-xs text-slate-300 focus:border-blue-500 focus:outline-none cursor-pointer"
+            >
+              <option value="Kore">Voice: Kore</option>
+              <option value="Puck">Voice: Puck</option>
+              <option value="Charon">Voice: Charon</option>
+              <option value="Fenrir">Voice: Fenrir</option>
+              <option value="Zephyr">Voice: Zephyr</option>
+            </select>
             <button
               type="button"
               onClick={() => setShowDocsPicker((p) => !p)}
@@ -665,8 +812,31 @@ export function ChatWorkspaceView({
                       {msg.content}
                     </div>
                   ) : (
-                    <div className="w-full rounded-xl border border-slate-800/80 bg-[#0B1120] px-5 py-4">
+                    <div className="w-full rounded-xl border border-slate-800/80 bg-[#0B1120] px-5 py-4 space-y-3">
                       <MarkdownRenderer content={msg.content} />
+                      <div className="flex items-center justify-end border-t border-slate-800/60 pt-2">
+                        <button
+                          type="button"
+                          disabled={synthesizingMsgId === msg.id}
+                          onClick={() => void handleSpeakMessage(msg.id, msg.content)}
+                          className="inline-flex items-center gap-1.5 rounded-md border border-slate-800 bg-[#060913] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-blue-500/50 hover:text-white cursor-pointer"
+                        >
+                          {synthesizingMsgId === msg.id ? (
+                            <Loader2 className="h-3 w-3 animate-spin text-blue-400" />
+                          ) : speakingMsgId === msg.id ? (
+                            <Square className="h-3 w-3 fill-current text-rose-400" />
+                          ) : (
+                            <Volume2 className="h-3 w-3 text-blue-400" />
+                          )}
+                          <span>
+                            {synthesizingMsgId === msg.id
+                              ? 'Generating Audio...'
+                              : speakingMsgId === msg.id
+                                ? 'Stop Voice'
+                                : 'Speak Reply'}
+                          </span>
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -763,6 +933,26 @@ export function ChatWorkspaceView({
                     maxLength={8000}
                     className="max-h-40 min-h-[44px] flex-1 resize-none bg-transparent px-1.5 py-1 text-sm text-white placeholder:text-slate-500 focus:outline-none disabled:opacity-60"
                   />
+
+                  <button
+                    type="button"
+                    disabled={isStreaming}
+                    onClick={handleToggleVoiceInput}
+                    title={isListening ? 'Stop voice capture' : 'Speak prompt (Voice Assistant)'}
+                    aria-label={isListening ? 'Stop voice capture' : 'Start voice capture'}
+                    className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-2 text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                      isListening
+                        ? 'border-rose-500/60 bg-rose-600/20 text-rose-200'
+                        : 'border-slate-800 bg-[#0B1120] text-slate-300 hover:border-blue-500/50 hover:text-white'
+                    }`}
+                  >
+                    {isListening ? (
+                      <MicOff className="h-3.5 w-3.5 animate-pulse" />
+                    ) : (
+                      <Mic className="h-3.5 w-3.5 text-blue-400" />
+                    )}
+                    <span className="hidden sm:inline">{isListening ? 'Listening...' : 'Voice'}</span>
+                  </button>
 
                   {isStreaming ? (
                     <button

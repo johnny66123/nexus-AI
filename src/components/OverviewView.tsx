@@ -38,6 +38,7 @@ interface OverviewViewProps {
     view:
       | 'assistants'
       | 'conversations'
+      | 'google'
       | 'master'
       | 'gateway'
       | 'orchestration'
@@ -70,6 +71,12 @@ export function OverviewView({
   const featuredAssistants = assistants.slice(0, 6);
 
   const modules = [
+    {
+      id: 'google' as const,
+      title: 'Google Ecosystem',
+      desc: 'OAuth 2.0 connectors for Gmail, Drive, Docs, Sheets, Calendar, Maps & more.',
+      icon: Globe,
+    },
     {
       id: 'master' as const,
       title: 'Master AI & Agents',
@@ -133,7 +140,7 @@ export function OverviewView({
         {!bannerError ? (
           <img
             src="/src/assets/images/nexus_banner_abstract_1794856491385.jpg"
-            alt="NEXUS AI architectural backdrop"
+            alt="NEVUS AI architectural backdrop"
             referrerPolicy="no-referrer"
             onError={() => setBannerError(true)}
             className="absolute inset-0 h-full w-full object-cover opacity-55"
@@ -149,7 +156,7 @@ export function OverviewView({
         <div className="relative z-10 flex flex-col justify-between gap-6 p-6 sm:p-8 lg:flex-row lg:items-end">
           <div className="max-w-2xl space-y-3">
             <p className="text-xs font-medium tracking-wide text-blue-400">
-              NEXUS AI Operating Platform · {profile.displayName} ({profile.role})
+              NEVUS AI Operating Platform · {profile.displayName} ({profile.role})
             </p>
             <h1 className="font-display text-2xl font-bold tracking-tight text-white sm:text-3xl lg:text-4xl">
               Build, orchestrate, and govern specialized AI systems
@@ -209,7 +216,7 @@ export function OverviewView({
         <div>
           <h2 className="font-display text-lg font-semibold text-white">Platform Modules</h2>
           <p className="text-sm text-slate-400">
-            Jump directly into any operational workspace across NEXUS AI.
+            Jump directly into any operational workspace across NEVUS AI.
           </p>
         </div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">

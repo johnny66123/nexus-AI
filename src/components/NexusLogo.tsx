@@ -42,9 +42,11 @@ export function NexusLogo({ compact = false }: NexusLogoProps) {
       </svg>
       {!compact && (
         <span className="font-display text-base font-bold tracking-tight text-slate-100 whitespace-nowrap shrink-0">
-          NEXUS AI
+          NEVUS AI
         </span>
       )}
     </div>
   );
 }
+
+export const NevusLogo = NexusLogo;

@@ -63,6 +63,12 @@ export interface OverviewData {
 export interface HealthStatus {
   ok: boolean;
   version: string;
+  platform?: string;
+  runtime?: string;
+  databaseBackend?: string;
+  sessionSecretConfigured?: boolean;
+  googleOAuthConfigured?: boolean;
+  googleMapsConfigured?: boolean;
   apiKeyConfigured: boolean;
   providers?: {
     google: boolean;
@@ -1193,6 +1199,125 @@ export async function executeMasterRequest(payload: {
   });
   const data = await parseJsonResponse<{ run: MasterExecutionResult }>(res);
   return data.run;
+}
+
+// Module 12: NEVUS AI — Google Ecosystem Integration
+export type GoogleServiceId =
+  | 'search'
+  | 'gmail'
+  | 'drive'
+  | 'docs'
+  | 'sheets'
+  | 'slides'
+  | 'calendar'
+  | 'maps'
+  | 'contacts'
+  | 'tasks'
+  | 'photos'
+  | 'youtube'
+  | 'translate'
+  | 'cloud';
+
+export interface GoogleServiceStatusItem {
+  id: GoogleServiceId;
+  name: string;
+  category: 'Productivity' | 'Intelligence & Search' | 'Location & Media' | 'Cloud & Platform';
+  authType: 'oauth2' | 'gemini_key' | 'api_key_or_gemini' | 'api_key';
+  requiredScopes: string[];
+  requiredEnvVars: string[];
+  description: string;
+  supportedActions: string[];
+  status: 'connected' | 'needs_oauth' | 'needs_api_key';
+  detail: string;
+}
+
+export interface GoogleEcosystemStatusResponse {
+  oauthConfigured: boolean;
+  redirectUri: string;
+  connection: {
+    connected: boolean;
+    googleEmail: string;
+    grantedScopes: string[];
+    connectedServices: string[];
+    expiresAt: string | null;
+    hasRefreshToken: boolean;
+    authSource: 'oauth2' | 'firebase_popup';
+    updatedAt: string;
+  } | null;
+  services: GoogleServiceStatusItem[];
+}
+
+export interface GoogleExecuteResult {
+  requiresConfirmation?: boolean;
+  confirmationSummary?: string;
+  serviceId: GoogleServiceId;
+  action: string;
+  data?: unknown;
+}
+
+export async function fetchGoogleStatus(): Promise<GoogleEcosystemStatusResponse> {
+  const res = await apiFetch('/api/google/status');
+  return parseJsonResponse<GoogleEcosystemStatusResponse>(res);
+}
+
+export async function requestGoogleOAuthUrl(serviceIds?: GoogleServiceId[]): Promise<{
+  configured: boolean;
+  authUrl: string | null;
+  redirectUri: string;
+  scopes: string[];
+  message?: string;
+}> {
+  const res = await apiFetch('/api/google/oauth/url', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ serviceIds }),
+  });
+  return parseJsonResponse(res);
+}
+
+export async function connectGoogleAccessToken(
+  accessToken: string,
+  grantedScopes?: string[],
+): Promise<GoogleEcosystemStatusResponse> {
+  const res = await apiFetch('/api/google/connect-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accessToken, grantedScopes }),
+  });
+  return parseJsonResponse<GoogleEcosystemStatusResponse>(res);
+}
+
+export async function disconnectGoogleAccount(): Promise<{
+  ok: boolean;
+  status: GoogleEcosystemStatusResponse;
+}> {
+  const res = await apiFetch('/api/google/disconnect', { method: 'POST' });
+  return parseJsonResponse(res);
+}
+
+export async function executeGoogleAction(
+  action: string,
+  input: Record<string, unknown> = {},
+  confirmed = false,
+): Promise<GoogleExecuteResult> {
+  const res = await apiFetch('/api/google/execute', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, input, confirmed }),
+  });
+  return parseJsonResponse<GoogleExecuteResult>(res);
+}
+
+export async function runGoogleCommand(
+  command: string,
+  confirmed = false,
+): Promise<GoogleExecuteResult> {
+  const res = await apiFetch('/api/google/command', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ command, confirmed }),
+  });
+  return parseJsonResponse<GoogleExecuteResult>(res);
 }
 
 export function formatRelativeTime(isoDate: string): string {

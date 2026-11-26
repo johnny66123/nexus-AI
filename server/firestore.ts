@@ -1,4 +1,5 @@
-import { getApps, initializeApp } from 'firebase-admin/app';
+import { cert, getApps, initializeApp } from 'firebase-admin/app';
+import type { ServiceAccount } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
 import type { DecodedIdToken } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
@@ -18,11 +19,30 @@ import type {
 
 let firestoreInitialized = false;
 
+function parseServiceAccountFromEnv(): ServiceAccount | null {
+  const raw =
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+  if (!raw || !raw.trim()) return null;
+  try {
+    return JSON.parse(raw) as ServiceAccount;
+  } catch {
+    return null;
+  }
+}
+
 function ensureAdminApp() {
   if (!getApps().length) {
-    initializeApp({
-      projectId: firebaseConfig.projectId,
-    });
+    const serviceAccount = parseServiceAccountFromEnv();
+    if (serviceAccount) {
+      initializeApp({
+        credential: cert(serviceAccount),
+        projectId: firebaseConfig.projectId,
+      });
+    } else {
+      initializeApp({
+        projectId: firebaseConfig.projectId,
+      });
+    }
   }
   firestoreInitialized = true;
 }
@@ -32,9 +52,13 @@ function getAdminAuthInstance() {
   return getAuth();
 }
 
-function getAdminDbInstance() {
+export function getAdminDbInstance() {
   ensureAdminApp();
   return getFirestore(getApps()[0], firebaseConfig.firestoreDatabaseId);
+}
+
+export function hasFirebaseServiceAccount(): boolean {
+  return Boolean(parseServiceAccountFromEnv());
 }
 
 function isCloudSyncEnabled(): boolean {
@@ -56,6 +80,7 @@ export function getFirebaseProjectInfo() {
     projectId: firebaseConfig.projectId,
     databaseId: firebaseConfig.firestoreDatabaseId,
     initialized: firestoreInitialized,
+    serviceAccountConfigured: hasFirebaseServiceAccount(),
   };
 }
 

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import multer from 'multer';
 import { z } from 'zod';
@@ -35,6 +36,11 @@ import {
 } from './shared/schema.ts';
 import type { AIProviderId, AuthUser, ResearchProject, UserRole } from './shared/schema.ts';
 import { runAutomationWorkflow, startAutomationScheduler } from './server/automation.ts';
+import {
+  ensureCloudHydrated,
+  flushCloudPersistence,
+  getActiveDatabaseBackend,
+} from './server/cloudPersistence.ts';
 import { db } from './server/db.ts';
 import { generateResearchDocxBuffer, generateResearchPdfBuffer } from './server/exporters.ts';
 import { getFirebaseProjectInfo, verifyFirebaseIdToken } from './server/firestore.ts';
@@ -53,12 +59,23 @@ import {
   synthesizeSpeechWav,
   transcribeAudioBase64,
 } from './server/gemini.ts';
+import {
+  buildGoogleOAuthConsentUrl,
+  exchangeGoogleOAuthCode,
+  executeGoogleAction,
+  getGoogleEcosystemStatus,
+  GoogleIntegrationError,
+  isGoogleOAuthClientConfigured,
+  routeNaturalLanguageGoogleCommand,
+} from './server/googleServices.ts';
+import type { GoogleServiceId } from './server/googleServices.ts';
 import { createInitialPipelineStages, runIntelligenceInvestigation } from './server/intelligence.ts';
 import { chunkText, extractDocumentText } from './server/knowledge.ts';
 import { masterIntelligence } from './server/master.ts';
 import { executeSandboxedJavaScript } from './server/sandbox.ts';
 import {
   createRateLimiter,
+  hasPersistentSessionSecret,
   inspectPromptInjection,
   parseCookies,
   SESSION_COOKIE_NAME,
@@ -197,6 +214,27 @@ export function createApp() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '6mb' }));
 
+  // Baseline security headers (compatible with Vercel & iframe previews)
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'microphone=(self), geolocation=(self)');
+    next();
+  });
+
+  // Cloud DB hydration & mutation flush for serverless environments (Vercel + Supabase/Firestore)
+  app.use('/api', async (req, res, next) => {
+    await ensureCloudHydrated(db);
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.method !== 'OPTIONS') {
+      res.on('finish', () => {
+        if (res.statusCode < 400) {
+          void flushCloudPersistence(db);
+        }
+      });
+    }
+    next();
+  });
+
   const generalLimiter = createRateLimiter({
     windowMs: 60_000,
     maxRequests: 180,
@@ -228,6 +266,12 @@ export function createApp() {
     res.json({
       ok: true,
       version: '3.0',
+      platform: 'NEVUS AI',
+      runtime: process.env.VERCEL === '1' ? 'vercel-serverless' : 'node-server',
+      databaseBackend: getActiveDatabaseBackend(db),
+      sessionSecretConfigured: hasPersistentSessionSecret(),
+      googleOAuthConfigured: isGoogleOAuthClientConfigured(),
+      googleMapsConfigured: Boolean(process.env.GOOGLE_MAPS_API_KEY?.trim()),
       apiKeyConfigured: googleConfigured,
       providers: {
         google: googleConfigured,
@@ -2517,6 +2561,231 @@ export function createApp() {
     },
   );
 
+  // --- NEVUS AI Google Ecosystem Integration & OAuth 2.0 Routes ---
+  function getRequestOrigin(req: express.Request): string {
+    const protoHeader = req.headers['x-forwarded-proto'];
+    const proto = Array.isArray(protoHeader)
+      ? protoHeader[0]
+      : protoHeader?.split(',')[0]?.trim() || req.protocol || 'http';
+    const host = req.get('x-forwarded-host') || req.get('host') || 'localhost:3000';
+    return `${proto}://${host}`;
+  }
+
+  app.get('/api/google/status', requireAuth, (req, res) => {
+    res.json(getGoogleEcosystemStatus(req.authUser!.id, getRequestOrigin(req)));
+  });
+
+  app.post('/api/google/oauth/url', requireAuth, (req, res) => {
+    const schema = z.object({
+      serviceIds: z.array(z.string()).optional(),
+    });
+    const parsed = schema.safeParse(req.body ?? {});
+    const serviceIds = (parsed.success ? parsed.data.serviceIds : undefined) as
+      | GoogleServiceId[]
+      | undefined;
+    const result = buildGoogleOAuthConsentUrl({
+      userId: req.authUser!.id,
+      serviceIds,
+      requestOrigin: getRequestOrigin(req),
+    });
+    res.json(result);
+  });
+
+  app.get('/api/google/oauth/callback', async (req, res) => {
+    const code = typeof req.query.code === 'string' ? req.query.code : '';
+    const state = typeof req.query.state === 'string' ? req.query.state : '';
+    const error = typeof req.query.error === 'string' ? req.query.error : '';
+
+    if (error) {
+      res.redirect(`/?google_oauth_error=${encodeURIComponent(error)}`);
+      return;
+    }
+    if (!code || !state) {
+      res.redirect('/?google_oauth_error=missing_code_or_state');
+      return;
+    }
+
+    try {
+      const { userId, connection } = await exchangeGoogleOAuthCode({ code, state });
+      db.addAuditLog({
+        userId,
+        userEmail: connection.googleEmail,
+        action: 'google.oauth.connect',
+        resourceType: 'google_connection',
+        resourceId: userId,
+        details: `Authorized Google OAuth for ${connection.connectedServices.length} service(s)`,
+      });
+      await flushCloudPersistence(db);
+      res.redirect('/?google_connected=1');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Google OAuth exchange failed';
+      res.redirect(`/?google_oauth_error=${encodeURIComponent(msg)}`);
+    }
+  });
+
+  app.post('/api/google/connect-token', requireAuth, async (req, res) => {
+    const schema = z.object({
+      accessToken: z.string().trim().min(10),
+      grantedScopes: z.array(z.string()).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Valid Google OAuth accessToken is required.' });
+      return;
+    }
+    try {
+      const infoRes = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+        headers: { Authorization: `Bearer ${parsed.data.accessToken}` },
+      });
+      if (!infoRes.ok) {
+        res.status(401).json({ error: 'Google rejected the supplied access token.' });
+        return;
+      }
+      const userInfo = (await infoRes.json().catch(() => ({}))) as { email?: string };
+      const scopes = parsed.data.grantedScopes ?? ['openid', 'email', 'profile'];
+      db.upsertGoogleConnection({
+        userId: req.authUser!.id,
+        googleEmail: userInfo.email || req.authUser!.email,
+        grantedScopes: scopes,
+        connectedServices: [],
+        accessToken: parsed.data.accessToken,
+        authSource: 'firebase_popup',
+        expiresAt: new Date(Date.now() + 3500_000).toISOString(),
+      });
+      await flushCloudPersistence(db);
+      res.json(getGoogleEcosystemStatus(req.authUser!.id, getRequestOrigin(req)));
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Failed to verify Google access token.',
+      });
+    }
+  });
+
+  app.post('/api/google/disconnect', requireAuth, async (req, res) => {
+    const removed = db.deleteGoogleConnection(req.authUser!.id);
+    if (removed) {
+      db.addAuditLog({
+        userId: req.authUser!.id,
+        userEmail: req.authUser!.email,
+        action: 'google.oauth.disconnect',
+        resourceType: 'google_connection',
+        resourceId: req.authUser!.id,
+        details: 'Disconnected Google Ecosystem OAuth tokens',
+      });
+      await flushCloudPersistence(db);
+    }
+    res.json({ ok: true, status: getGoogleEcosystemStatus(req.authUser!.id, getRequestOrigin(req)) });
+  });
+
+  app.post(
+    '/api/google/execute',
+    requireAuth,
+    requireRole(['admin', 'developer']),
+    aiLimiter,
+    async (req, res) => {
+      const schema = z.object({
+        action: z.string().trim().min(2),
+        input: z.record(z.string(), z.unknown()).default({}),
+        confirmed: z.boolean().optional(),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Invalid Google action request.' });
+        return;
+      }
+      try {
+        const result = await executeGoogleAction({
+          userId: req.authUser!.id,
+          action: parsed.data.action,
+          input: parsed.data.input,
+          confirmed: parsed.data.confirmed,
+        });
+        await flushCloudPersistence(db);
+        res.json(result);
+      } catch (err) {
+        if (err instanceof GoogleIntegrationError) {
+          res.status(err.statusCode).json({ error: err.message, code: err.code });
+          return;
+        }
+        res.status(502).json({
+          error: err instanceof Error ? err.message : 'Google API execution failed.',
+        });
+      }
+    },
+  );
+
+  app.post(
+    '/api/google/command',
+    requireAuth,
+    requireRole(['admin', 'developer']),
+    aiLimiter,
+    async (req, res) => {
+      const schema = z.object({
+        command: z.string().trim().min(2).max(1500),
+        confirmed: z.boolean().optional(),
+      });
+      const parsed = schema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: 'Please enter a valid command for NEVUS AI.' });
+        return;
+      }
+      const inj = inspectPromptInjection(parsed.data.command);
+      if (inj.flagged) {
+        res.status(400).json({ error: 'Command blocked by NEVUS security policy.' });
+        return;
+      }
+      try {
+        const result = await routeNaturalLanguageGoogleCommand({
+          userId: req.authUser!.id,
+          command: parsed.data.command,
+          confirmed: parsed.data.confirmed,
+        });
+        await flushCloudPersistence(db);
+        res.json(result);
+      } catch (err) {
+        if (err instanceof GoogleIntegrationError) {
+          res.status(err.statusCode).json({ error: err.message, code: err.code });
+          return;
+        }
+        res.status(502).json({
+          error: err instanceof Error ? err.message : 'Failed to route Google ecosystem command.',
+        });
+      }
+    },
+  );
+
+  // --- Vercel Cron Automation Trigger ---
+  app.get('/api/cron/automation', async (req, res) => {
+    const cronSecret = process.env.CRON_SECRET?.trim();
+    if (cronSecret) {
+      const authHeader = req.headers.authorization;
+      if (authHeader !== `Bearer ${cronSecret}`) {
+        res.status(401).json({ error: 'Unauthorized cron invocation.' });
+        return;
+      }
+    }
+    const workflows = db.listWorkflows();
+    const nowMs = Date.now();
+    let executed = 0;
+    for (const wf of workflows) {
+      if (!wf.enabled || wf.triggerType !== 'schedule') continue;
+      const intervalMs = Math.max(1, wf.scheduleIntervalMinutes ?? 60) * 60_000;
+      const lastMs = wf.lastRunAt ? new Date(wf.lastRunAt).getTime() : 0;
+      if (nowMs - lastMs < intervalMs) continue;
+      const ownerProfile = db.getProfileForUser(wf.userId);
+      if (!ownerProfile) continue;
+      await runAutomationWorkflow({
+        workflow: wf,
+        triggerSource: 'schedule',
+        profile: ownerProfile,
+        bypassApproval: false,
+      });
+      executed++;
+    }
+    await flushCloudPersistence(db);
+    res.json({ ok: true, executed });
+  });
+
   // API 404 & Error Handlers
   app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'API endpoint not found.' });
@@ -2534,6 +2803,8 @@ async function startServer() {
   const PORT = Number(process.env.PORT || 3000);
   const isProduction = process.env.NODE_ENV === 'production';
   const app = createApp();
+
+  await ensureCloudHydrated(db);
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
@@ -2558,12 +2829,13 @@ async function startServer() {
   startAutomationScheduler();
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`NEXUS AI v2.0 server running on http://0.0.0.0:${PORT}`);
+    console.log(`NEVUS AI v3.0 server running on http://0.0.0.0:${PORT}`);
   });
 }
 
+const currentFile = fileURLToPath(import.meta.url);
 const isDirectRun =
-  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.meta.filename);
-if (isDirectRun) {
+  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(currentFile);
+if (isDirectRun && process.env.VERCEL !== '1') {
   void startServer();
 }

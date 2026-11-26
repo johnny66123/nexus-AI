@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { WORKSPACE_LIMITS } from '../shared/schema.ts';
@@ -67,7 +68,25 @@ import {
   syncUsageRecordToFirestore,
   syncUserToFirestore,
 } from './firestore.ts';
-import { hashPassword, verifyPassword } from './security.ts';
+import { decryptSecret, encryptSecret, hashPassword, verifyPassword } from './security.ts';
+
+export interface GoogleConnectionRecord {
+  userId: string;
+  googleEmail: string;
+  grantedScopes: string[];
+  connectedServices: string[];
+  accessToken: string;
+  refreshToken: string | null;
+  expiresAt: string | null;
+  authSource: 'oauth2' | 'firebase_popup';
+  updatedAt: string;
+}
+
+export interface WorkspaceCloudSnapshot {
+  schemaVersion: number;
+  exportedAt: string;
+  tables: Record<string, Array<Record<string, unknown>>>;
+}
 
 export interface LabWorkspaceRecord {
   id: string;
@@ -111,13 +130,37 @@ interface LegacyJsonStore {
 
 export class NexusDatabaseService {
   private db: DatabaseSync;
+  public readonly storageMode: 'local-sqlite' | 'ephemeral-sqlite' | 'memory';
+  public readonly resolvedDbPath: string;
 
   constructor(dbPath?: string) {
-    const resolvedPath =
-      dbPath ?? process.env.NEXUS_DB_PATH ?? path.resolve(process.cwd(), 'data', 'nexus.db');
+    let resolvedPath =
+      dbPath ??
+      process.env.NEXUS_DB_PATH ??
+      (process.env.VERCEL === '1'
+        ? path.join(os.tmpdir(), 'nevus.db')
+        : path.resolve(process.cwd(), 'data', 'nexus.db'));
+
+    let mode: 'local-sqlite' | 'ephemeral-sqlite' | 'memory' =
+      resolvedPath === ':memory:'
+        ? 'memory'
+        : process.env.VERCEL === '1'
+          ? 'ephemeral-sqlite'
+          : 'local-sqlite';
+
     if (resolvedPath !== ':memory:') {
-      fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+      try {
+        fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+      } catch {
+        // Fallback to OS temp directory if cwd/data is read-only (e.g., Vercel serverless)
+        resolvedPath = path.join(os.tmpdir(), 'nevus.db');
+        mode = 'ephemeral-sqlite';
+        fs.mkdirSync(path.dirname(resolvedPath), { recursive: true });
+      }
     }
+
+    this.resolvedDbPath = resolvedPath;
+    this.storageMode = mode;
     this.db = new DatabaseSync(resolvedPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;');
     this.initSchema();
@@ -488,6 +531,18 @@ export class NexusDatabaseService {
         status TEXT NOT NULL,
         created_at TEXT NOT NULL,
         completed_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS google_connections (
+        user_id TEXT PRIMARY KEY,
+        google_email TEXT NOT NULL,
+        granted_scopes_json TEXT NOT NULL DEFAULT '[]',
+        connected_services_json TEXT NOT NULL DEFAULT '[]',
+        encrypted_access_token TEXT NOT NULL,
+        encrypted_refresh_token TEXT,
+        expires_at TEXT,
+        auth_source TEXT NOT NULL DEFAULT 'oauth2',
+        updated_at TEXT NOT NULL
       );
     `);
 
@@ -3234,7 +3289,192 @@ export class NexusDatabaseService {
       completedAt: r.completed_at ? String(r.completed_at) : null,
     }));
   }
+
+  // --- Google Ecosystem OAuth Connections (Encrypted Token Storage) ---
+  getGoogleConnectionForUser(userId: string): GoogleConnectionRecord | null {
+    const row = this.db
+      .prepare('SELECT * FROM google_connections WHERE user_id = ?')
+      .get(userId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+
+    const accessToken = decryptSecret(String(row.encrypted_access_token ?? ''));
+    if (!accessToken) return null;
+
+    return {
+      userId: String(row.user_id),
+      googleEmail: String(row.google_email),
+      grantedScopes: JSON.parse(String(row.granted_scopes_json ?? '[]')) as string[],
+      connectedServices: JSON.parse(String(row.connected_services_json ?? '[]')) as string[],
+      accessToken,
+      refreshToken: row.encrypted_refresh_token
+        ? decryptSecret(String(row.encrypted_refresh_token))
+        : null,
+      expiresAt: row.expires_at ? String(row.expires_at) : null,
+      authSource: (row.auth_source === 'firebase_popup' ? 'firebase_popup' : 'oauth2'),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  upsertGoogleConnection(input: {
+    userId: string;
+    googleEmail: string;
+    grantedScopes: string[];
+    connectedServices: string[];
+    accessToken: string;
+    refreshToken?: string | null;
+    expiresAt?: string | null;
+    authSource?: 'oauth2' | 'firebase_popup';
+  }): GoogleConnectionRecord {
+    const now = new Date().toISOString();
+    const existing = this.getGoogleConnectionForUser(input.userId);
+    const mergedScopes = Array.from(
+      new Set([...(existing?.grantedScopes ?? []), ...input.grantedScopes]),
+    );
+    const mergedServices = Array.from(
+      new Set([...(existing?.connectedServices ?? []), ...input.connectedServices]),
+    );
+    const refreshToStore = input.refreshToken ?? existing?.refreshToken ?? null;
+    const encryptedAccess = encryptSecret(input.accessToken);
+    const encryptedRefresh = refreshToStore ? encryptSecret(refreshToStore) : null;
+
+    this.db
+      .prepare(`
+        INSERT INTO google_connections (
+          user_id, google_email, granted_scopes_json, connected_services_json,
+          encrypted_access_token, encrypted_refresh_token, expires_at, auth_source, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+          google_email = excluded.google_email,
+          granted_scopes_json = excluded.granted_scopes_json,
+          connected_services_json = excluded.connected_services_json,
+          encrypted_access_token = excluded.encrypted_access_token,
+          encrypted_refresh_token = excluded.encrypted_refresh_token,
+          expires_at = excluded.expires_at,
+          auth_source = excluded.auth_source,
+          updated_at = excluded.updated_at
+      `)
+      .run(
+        input.userId,
+        input.googleEmail,
+        JSON.stringify(mergedScopes),
+        JSON.stringify(mergedServices),
+        encryptedAccess,
+        encryptedRefresh,
+        input.expiresAt ?? existing?.expiresAt ?? null,
+        input.authSource ?? existing?.authSource ?? 'oauth2',
+        now,
+      );
+
+    return this.getGoogleConnectionForUser(input.userId)!;
+  }
+
+  deleteGoogleConnection(userId: string): boolean {
+    const res = this.db.prepare('DELETE FROM google_connections WHERE user_id = ?').run(userId);
+    return res.changes > 0;
+  }
+
+  // --- Cloud Snapshot Hydration & Sync Helpers (Vercel Serverless Persistence) ---
+  exportCloudSnapshot(): WorkspaceCloudSnapshot {
+    const tableOrder = [
+      'users',
+      'assistants',
+      'conversations',
+      'messages',
+      'assistant_memories',
+      'knowledge_documents',
+      'knowledge_chunks',
+      'orchestration_runs',
+      'research_reports',
+      'lab_workspaces',
+      'automation_workflows',
+      'workflow_runs',
+      'media_projects',
+      'marketplace_listings',
+      'marketplace_reviews',
+      'research_projects',
+      'research_sources',
+      'provider_settings',
+      'specialist_agents',
+      'agent_tasks',
+      'master_runs',
+      'google_connections',
+    ];
+    const tables: Record<string, Array<Record<string, unknown>>> = {};
+    for (const table of tableOrder) {
+      tables[table] = this.db.prepare(`SELECT * FROM ${table}`).all() as Array<
+        Record<string, unknown>
+      >;
+    }
+    return {
+      schemaVersion: 3,
+      exportedAt: new Date().toISOString(),
+      tables,
+    };
+  }
+
+  importCloudSnapshot(snapshot: WorkspaceCloudSnapshot): void {
+    if (!snapshot || typeof snapshot !== 'object' || !snapshot.tables) return;
+    const tableOrder = [
+      'users',
+      'assistants',
+      'conversations',
+      'messages',
+      'assistant_memories',
+      'knowledge_documents',
+      'knowledge_chunks',
+      'orchestration_runs',
+      'research_reports',
+      'lab_workspaces',
+      'automation_workflows',
+      'workflow_runs',
+      'media_projects',
+      'marketplace_listings',
+      'marketplace_reviews',
+      'research_projects',
+      'research_sources',
+      'provider_settings',
+      'specialist_agents',
+      'agent_tasks',
+      'master_runs',
+      'google_connections',
+    ];
+
+    this.db.exec('PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;');
+    try {
+      for (const table of [...tableOrder].reverse()) {
+        if (Array.isArray(snapshot.tables[table])) {
+          this.db.exec(`DELETE FROM ${table}`);
+        }
+      }
+
+      for (const table of tableOrder) {
+        const rows = snapshot.tables[table];
+        if (!Array.isArray(rows) || rows.length === 0) continue;
+        for (const row of rows) {
+          const cols = Object.keys(row).filter((k) => /^[a-zA-Z0-9_]+$/.test(k));
+          if (cols.length === 0) continue;
+          const placeholders = cols.map(() => '?').join(', ');
+          const sql = `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})`;
+          const values = cols.map((c) => {
+            const v = row[c];
+            if (v === undefined || v === null) return null;
+            if (typeof v === 'string' || typeof v === 'number' || typeof v === 'bigint') {
+              return v;
+            }
+            if (typeof v === 'boolean') return v ? 1 : 0;
+            return JSON.stringify(v);
+          });
+          this.db.prepare(sql).run(...values);
+        }
+      }
+      this.db.exec('COMMIT; PRAGMA foreign_keys = ON;');
+    } catch (err) {
+      this.db.exec('ROLLBACK; PRAGMA foreign_keys = ON;');
+      throw err;
+    }
+  }
 }
 
 export const db = new NexusDatabaseService();
+
 

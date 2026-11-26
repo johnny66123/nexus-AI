@@ -6,6 +6,7 @@ import {
   Brain,
   ChevronLeft,
   ChevronRight,
+  Cloud,
   Code2,
   Cpu,
   Globe,
@@ -44,6 +45,7 @@ import { AutomationStudioView } from './components/AutomationStudioView.tsx';
 import { ChatWorkspaceView } from './components/ChatWorkspaceView.tsx';
 import { ConversationsView } from './components/ConversationsView.tsx';
 import { DevelopmentLabView } from './components/DevelopmentLabView.tsx';
+import { GoogleEcosystemView } from './components/GoogleEcosystemView.tsx';
 import { KnowledgeCentreView } from './components/KnowledgeCentreView.tsx';
 import { MarketplaceView } from './components/MarketplaceView.tsx';
 import { MediaStudioView } from './components/MediaStudioView.tsx';
@@ -77,6 +79,7 @@ import type { HealthStatus, OverviewData } from './lib/api.ts';
 
 type ViewId =
   | 'overview'
+  | 'google'
   | 'master'
   | 'gateway'
   | 'assistants'
@@ -125,6 +128,8 @@ export default function App() {
   const [memoryAssistantId, setMemoryAssistantId] = useState<string | null>(null);
   const [globalModelSelection, setGlobalModelSelection] = useState<string>('auto');
   const [avatarError, setAvatarError] = useState(false);
+  const [googleOAuthNotice, setGoogleOAuthNotice] = useState<string | null>(null);
+  const [googleOAuthError, setGoogleOAuthError] = useState<string | null>(null);
 
   const resetAuthState = useCallback((notice?: string | null) => {
     setCurrentUser(null);
@@ -158,7 +163,7 @@ export default function App() {
         resetAuthState(err.message);
         return;
       }
-      setLoadError(err instanceof Error ? err.message : 'Failed to load NEXUS AI workspace.');
+      setLoadError(err instanceof Error ? err.message : 'Failed to load NEVUS AI workspace.');
     } finally {
       setLoading(false);
     }
@@ -169,6 +174,24 @@ export default function App() {
       resetAuthState(message || 'Your session has expired. Please sign in again.');
     });
   }, [resetAuthState]);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const connected = params.get('google_connected');
+      const oauthErr = params.get('google_oauth_error');
+      if (connected === '1' || oauthErr) {
+        if (connected === '1') {
+          setGoogleOAuthNotice('Google Account authorized and connected successfully.');
+        }
+        if (oauthErr) {
+          setGoogleOAuthError(`Google OAuth error: ${oauthErr}`);
+        }
+        setView('google');
+        window.history.replaceState({}, '', window.location.pathname);
+      }
+    }
+  }, []);
 
   useEffect(() => {
     void (async () => {
@@ -376,6 +399,7 @@ export default function App() {
     {
       title: 'Studios & Ecosystem',
       items: [
+        { id: 'google', label: 'Google Ecosystem', icon: Cloud },
         { id: 'lab', label: 'Dev Lab', icon: Code2 },
         { id: 'automation', label: 'Automation', icon: Workflow },
         { id: 'media', label: 'Media Studio', icon: Volume2 },
@@ -395,6 +419,7 @@ export default function App() {
   const breadcrumbLabel = (() => {
     const labels: Record<ViewId, string> = {
       overview: 'Overview',
+      google: 'Google Ecosystem',
       master: 'Master Intelligence & Specialist Agents',
       gateway: 'Multi-Model Gateway',
       assistants: 'AI Agent Factory',
@@ -403,7 +428,7 @@ export default function App() {
       conversations: 'Recent Conversations',
       orchestration: 'Multi-Agent Orchestration',
       memory: 'Advanced AI Memory',
-      research: 'NEXUS Intelligence Engine',
+      research: 'NEVUS Intelligence Engine',
       lab: 'AI Development Lab',
       automation: 'Automation Studio',
       media: 'AI Media Studio',
@@ -557,7 +582,7 @@ export default function App() {
             </button>
             <div className="flex min-w-0 items-center gap-2 text-sm">
               <span className="font-display font-semibold text-slate-400 whitespace-nowrap shrink-0">
-                NEXUS AI
+                NEVUS AI
               </span>
               <span className="text-slate-600" aria-hidden="true">
                 /
@@ -642,7 +667,7 @@ export default function App() {
             <div className="mx-auto max-w-lg rounded-xl border border-rose-500/40 bg-rose-950/30 p-6 text-center">
               <AlertCircle className="mx-auto h-8 w-8 text-rose-400" />
               <h1 className="mt-3 font-display text-lg font-semibold text-white">
-                Unable to load NEXUS AI
+                Unable to load NEVUS AI
               </h1>
               <p className="mt-1 text-sm text-rose-200">{loadError ?? 'Workspace unavailable.'}</p>
               <button
@@ -804,9 +829,18 @@ export default function App() {
                   <AdminView currentUser={currentUser} onWorkspaceRestored={loadWorkspace} />
                 )}
 
+                {view === 'google' && (
+                  <GoogleEcosystemView
+                    canEdit={canEdit}
+                    oauthNotice={googleOAuthNotice}
+                    oauthError={googleOAuthError}
+                  />
+                )}
+
                 {view === 'settings' && (
                   <SettingsProfileView
                     profile={profile}
+                    health={health}
                     onSaveProfile={handleSaveProfile}
                     onLogout={handleLogout}
                   />

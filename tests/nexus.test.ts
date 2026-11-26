@@ -18,7 +18,15 @@ const {
   deduplicateSources,
 } = await import('../server/intelligence.ts');
 const { executeSandboxedJavaScript } = await import('../server/sandbox.ts');
-const { inspectPromptInjection, hashPassword, verifyPassword } = await import('../server/security.ts');
+const {
+  decryptSecret,
+  encryptSecret,
+  hashPassword,
+  inspectPromptInjection,
+  signOAuthState,
+  verifyOAuthState,
+  verifyPassword,
+} = await import('../server/security.ts');
 const { chunkText } = await import('../server/knowledge.ts');
 const { GatewayProviderError, ModelGatewayService } = await import('../server/gateway.ts');
 const { classifyRequest, selectOptimalModel } = await import('../server/master.ts');
@@ -899,4 +907,86 @@ test('Auth lifecycle: HTTPS cross-origin SameSite=None cookie, Bearer sessionTok
   assert.equal(logoutRes.data.ok, true);
   assert.ok(logoutRes.setCookie?.includes('Max-Age=0'));
   assert.ok(logoutRes.setCookie?.includes('SameSite=None'));
+});
+
+test('Vercel & Google Ecosystem: encryption, OAuth CSRF state, health readiness, honest Google status, confirmation gate & CRON_SECRET', async () => {
+  // 1. AES-256-GCM token encryption roundtrip & tamper protection
+  const cipher = encryptSecret('ya29.test-google-access-token');
+  assert.notEqual(cipher, 'ya29.test-google-access-token');
+  assert.equal(decryptSecret(cipher), 'ya29.test-google-access-token');
+  assert.equal(decryptSecret(`${cipher.slice(0, -3)}xxx`), null);
+
+  // 2. OAuth CSRF state signing & tamper rejection
+  const state = signOAuthState('usr-admin-primary', 'https://nevus.vercel.app/api/google/oauth/callback');
+  const parsedState = verifyOAuthState(state);
+  assert.ok(parsedState);
+  assert.equal(parsedState.userId, 'usr-admin-primary');
+  assert.equal(verifyOAuthState(`${state}tamper`), null);
+
+  // 3. Health readiness fields for Vercel deployment
+  const health = await apiRequest('/api/health');
+  assert.equal(health.status, 200);
+  assert.equal(health.data.platform, 'NEVUS AI');
+  assert.equal(typeof health.data.databaseBackend, 'string');
+  assert.equal(typeof health.data.sessionSecretConfigured, 'boolean');
+  assert.equal(typeof health.data.googleOAuthConfigured, 'boolean');
+
+  // 4. Google status endpoint requires auth and never fakes OAuth connections
+  const unauthGoogle = await apiRequest('/api/google/status');
+  assert.equal(unauthGoogle.status, 401);
+
+  const adminCookie = await loginAs('admin@nexus.ai', 'nexus-admin-2026');
+  const statusRes = await apiRequest('/api/google/status', { cookie: adminCookie });
+  assert.equal(statusRes.status, 200);
+  assert.equal(statusRes.data.services.length, 14);
+  const gmailSvc = statusRes.data.services.find((s: { id: string }) => s.id === 'gmail');
+  assert.equal(gmailSvc.status, 'needs_oauth');
+
+  // 5. Mutating Google actions require explicit confirmation first
+  const unconfirmedSend = await apiRequest('/api/google/execute', {
+    method: 'POST',
+    cookie: adminCookie,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'gmail_send',
+      input: { to: 'team@example.com', subject: 'Hello', body: 'Test email' },
+      confirmed: false,
+    }),
+  });
+  assert.equal(unconfirmedSend.status, 200);
+  assert.equal(unconfirmedSend.data.requiresConfirmation, true);
+
+  // After confirmation without Google OAuth token -> honest 412 GOOGLE_OAUTH_REQUIRED
+  const confirmedWithoutOauth = await apiRequest('/api/google/execute', {
+    method: 'POST',
+    cookie: adminCookie,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'gmail_send',
+      input: { to: 'team@example.com', subject: 'Hello', body: 'Test email' },
+      confirmed: true,
+    }),
+  });
+  assert.equal(confirmedWithoutOauth.status, 412);
+  assert.equal(confirmedWithoutOauth.data.code, 'GOOGLE_OAUTH_REQUIRED');
+
+  // 6. Vercel Cron endpoint enforces CRON_SECRET when configured
+  const prevCronSecret = process.env.CRON_SECRET;
+  process.env.CRON_SECRET = 'nevus-cron-secret-test';
+  try {
+    const cronBlocked = await apiRequest('/api/cron/automation');
+    assert.equal(cronBlocked.status, 401);
+
+    const cronAllowed = await apiRequest('/api/cron/automation', {
+      headers: { Authorization: 'Bearer nevus-cron-secret-test' },
+    });
+    assert.equal(cronAllowed.status, 200);
+    assert.equal(cronAllowed.data.ok, true);
+  } finally {
+    if (prevCronSecret === undefined) {
+      delete process.env.CRON_SECRET;
+    } else {
+      process.env.CRON_SECRET = prevCronSecret;
+    }
+  }
 });
